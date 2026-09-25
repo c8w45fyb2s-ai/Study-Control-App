@@ -1,0 +1,54 @@
+# macOS
+.DS_Store
+
+# Xcode user-specific state and build output
+DerivedData/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+xcuserdata/
+*.xcarchive/
+*.dSYM/
+*.ipa
+*.dmg
+*.pkg
+*.app/
+
+# Swift / local packaging output
+.build/
+.build-*/
+.swiftpm/
+dist/
+
+# Local visual QA evidence and working notes
+/ui-overlap-fix-2026-07-11/
+/design-qa.md
+
+# 各代理的独立测试数据目录（不提交）
+test-data/
+test-data-*/
+*.testdata/
+
+# Local credentials and provisioning files
+.env
+.env.*
+!.env.example
+*.p8
+*.p12
+*.pem
+*.key
+*.cer
+*.mobileprovision
+
+# Study Companion local data or exported backups
+store.json
+store.backup.*.json
+store-backup*.json
+StudyCompanion-backup*.json
+StudyCompanionBackup*.json
+StudyCompanionPrivacyBackup*.json
+StudyCompanionExport*.md
+StudyCompanionAnki*.tsv
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
