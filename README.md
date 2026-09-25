@@ -1,6 +1,4 @@
-由于是主要vibe coding出来练手学习的项目，所以有太多不足了，恳请多多指教和批评，以下的readme内容也都是ai出来的内容，恳请指出错误与不足
-
-# Study Companion
+# Study-Control-App
 
 学习助手双端原型：macOS 端负责资料导入、OCR/PDF 文本提取、DeepSeek 分析和人工确认；iOS 端负责今日复习、提醒管理和手机本地通知。数据默认保存在本机，AI 功能采用用户自备 API Key（BYOK）。
 
@@ -109,7 +107,7 @@ make package
 
 如果以后要启用 Mac 与 iPhone 的实际 iCloud 同步，需要付费 Apple Developer Program 账号，并在 Xcode 的 Signing & Capabilities 中为 macOS 和 iOS 都添加 iCloud/CloudKit capability。
 
-## DeepSeek
+## DeepSeek（暂时支持DS）
 
 默认配置：
 
@@ -128,3 +126,5 @@ make package
 ## 参与贡献
 
 提交改动前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。安全问题的报告方式见 [SECURITY.md](SECURITY.md)。
+
+由于是主要vibe coding出来练手学习的项目，所以有太多不足了，恳请多多指教和批评，以下的readme内容也都是ai出来的内容，恳请指出错误与不足
