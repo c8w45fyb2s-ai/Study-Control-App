@@ -7,7 +7,7 @@
 ## 环境要求
 
 - macOS 14 或更高版本
-- Xcode（包含 iOS 17 / macOS 14 或更高版本 SDK）
+- 推荐使用 Xcode 26.3 或更高版本；App 最低运行系统仍为 iOS 17 / macOS 14。iOS 26 标签栏滚动收起功能需要 Xcode 26 SDK，旧编译器使用标准标签栏。
 - 可选：兼容服务的 API Key；Ollama / LM Studio 本地连接可选择无需鉴权
 
 ## 运行方式
@@ -48,7 +48,7 @@ make verify-ai-plan
 make verify-active-recall verify-data-layer verify-ai-plan verify-daily-plan verify-merge-import verify-document-evidence verify-integration
 ```
 
-GitHub Actions 会运行这些验证及 macOS、iOS Simulator 构建。PDF 自动测试检查页码、提取方式、失败页保留、取消和扫描页的基本识别能力，不比较完整 OCR 文本。
+GitHub Actions 在 macos-15 runner 上显式使用 Xcode 26.3，运行这些验证及 macOS、iOS Simulator 构建，并输出 Xcode / Swift 版本。两个平台的构建独立完成，一个失败不会取消另一个。PDF 自动测试检查页码、提取方式、失败页保留、取消和扫描页的基本识别能力，不比较完整 OCR 文本。
 
 验证四类 AI 协议与 mock 网络行为（不需要付费密钥）：
 

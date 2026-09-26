@@ -133,10 +133,11 @@ struct ContentView: View {
 /// - iOS 17：完全使用原生标准外观。
 ///
 /// 这里**不**自绘底栏，也**不**把普通模糊材质当成 Liquid Glass；
-/// 所有新 API 都用 `#available` 判断，deployment target 仍是 iOS 17。
+/// iOS 26 API 同时检查编译器和运行系统版本，deployment target 仍是 iOS 17。
 private struct StudyPrimaryTabChrome: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
+        #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
             // iOS 26 的系统标签栏本身就是 Liquid Glass 外观；这里只额外启用
             // 系统"向下滚动时收起标签栏"的行为。
@@ -148,6 +149,10 @@ private struct StudyPrimaryTabChrome: ViewModifier {
         } else {
             content
         }
+        #else
+        // Xcode 16 的 SDK 不包含 iOS 26 API，保留原生标准标签栏。
+        content
+        #endif
     }
 }
 

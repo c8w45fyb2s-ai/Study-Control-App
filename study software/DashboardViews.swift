@@ -545,10 +545,10 @@ private struct CheckInSparkBurst: View {
     }
 
     private func offset(for spark: Spark) -> CGSize {
-        let radians = spark.angle * .pi / 180
+        let radians: Double = spark.angle * .pi / 180
         return CGSize(
-            width: cos(radians) * spark.distance,
-            height: sin(radians) * spark.distance
+            width: CGFloat(cos(radians)) * spark.distance,
+            height: CGFloat(sin(radians)) * spark.distance
         )
     }
 

@@ -501,32 +501,34 @@ enum PlanCandidateBuilder {
             )
         }
         let candidateLines: [String] = zip(input.candidates, signals).map { candidate, signal in
-            [
-                signal.identityKey,
-                candidate.source.kind.rawValue,
-                candidate.source.reviewTaskID?.uuidString ?? "-",
-                candidate.source.courseID?.uuidString ?? "-",
-                candidate.source.occurrenceID?.uuidString ?? "-",
-                candidate.source.knowledgePointID?.uuidString ?? "-",
-                candidate.title,
-                "\(candidate.plannedScope.unit.rawValue):\(candidate.plannedScope.amount)",
-                candidate.minimumScope.map { "\($0.unit.rawValue):\($0.amount)" } ?? "-",
-                "est:\(candidate.estimatedMinutes)",
-                candidate.dueDate.map { "due:\(Int($0.timeIntervalSince1970))" } ?? "due:-",
-                "overdue:\(signal.overdueDays)",
-                "within:\(signal.dueWithinDays.map(String.init) ?? "-")",
-                "prio:\(signal.priority.map(String.init) ?? "-")",
-                "mastery:\(signal.mastery.map { String(format: "%.3f", $0) } ?? "-")",
-                "mistake:\(signal.linkedMistakeID?.uuidString ?? "-")",
-                "kp:\(signal.linkedKnowledgePointID?.uuidString ?? "-")",
-                "exam:\(signal.examDaysRemaining.map(String.init) ?? "-")",
-                "burden:\(signal.courseBurdenLevel.map { String($0.rank) } ?? "-")",
-                "material:\(signal.hasRealMaterial)",
-                "courseMaterial:\(signal.hasCourseMaterials)",
-                "pinned:\(signal.isPinned)",
-                "splittable:\(candidate.isSplittable)",
-                candidate.preferredStart.map { "start:\(Int($0.timeIntervalSince1970))" } ?? "start:-"
-            ].joined(separator: "~")
+            // 分步构造，避免旧版 Swift 对长数组表达式的类型推断超时。
+            // 字段顺序与格式参与持久化指纹，必须保持稳定。
+            var fields: [String] = []
+            fields.append(signal.identityKey)
+            fields.append(candidate.source.kind.rawValue)
+            fields.append(candidate.source.reviewTaskID?.uuidString ?? "-")
+            fields.append(candidate.source.courseID?.uuidString ?? "-")
+            fields.append(candidate.source.occurrenceID?.uuidString ?? "-")
+            fields.append(candidate.source.knowledgePointID?.uuidString ?? "-")
+            fields.append(candidate.title)
+            fields.append("\(candidate.plannedScope.unit.rawValue):\(candidate.plannedScope.amount)")
+            fields.append(candidate.minimumScope.map { "\($0.unit.rawValue):\($0.amount)" } ?? "-")
+            fields.append("est:\(candidate.estimatedMinutes)")
+            fields.append(candidate.dueDate.map { "due:\(Int($0.timeIntervalSince1970))" } ?? "due:-")
+            fields.append("overdue:\(signal.overdueDays)")
+            fields.append("within:\(signal.dueWithinDays.map(String.init) ?? "-")")
+            fields.append("prio:\(signal.priority.map(String.init) ?? "-")")
+            fields.append("mastery:\(signal.mastery.map { String(format: "%.3f", $0) } ?? "-")")
+            fields.append("mistake:\(signal.linkedMistakeID?.uuidString ?? "-")")
+            fields.append("kp:\(signal.linkedKnowledgePointID?.uuidString ?? "-")")
+            fields.append("exam:\(signal.examDaysRemaining.map(String.init) ?? "-")")
+            fields.append("burden:\(signal.courseBurdenLevel.map { String($0.rank) } ?? "-")")
+            fields.append("material:\(signal.hasRealMaterial)")
+            fields.append("courseMaterial:\(signal.hasCourseMaterials)")
+            fields.append("pinned:\(signal.isPinned)")
+            fields.append("splittable:\(candidate.isSplittable)")
+            fields.append(candidate.preferredStart.map { "start:\(Int($0.timeIntervalSince1970))" } ?? "start:-")
+            return fields.joined(separator: "~")
         }
         components.append(contentsOf: candidateLines.sorted())
 

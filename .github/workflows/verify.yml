@@ -8,6 +8,10 @@ name: Verify study flows
 permissions:
   contents: read
 
+env:
+  # Explicit SDK selection: macos-15 currently defaults to Xcode 16.4.
+  DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+
 jobs:
   behavior:
     runs-on: macos-15
@@ -16,6 +20,10 @@ jobs:
       STUDYCOMPANION_TEST_MODE: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Show build toolchain
+        run: |
+          xcodebuild -version
+          xcrun swift --version
       - name: Verify local study and persistence flows
         run: |
           make BUILD_DIR="$RUNNER_TEMP/study-checks" \
@@ -32,12 +40,17 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 45
     strategy:
+      fail-fast: false
       matrix:
         destination:
           - generic/platform=macOS
           - generic/platform=iOS Simulator
     steps:
       - uses: actions/checkout@v4
+      - name: Show build toolchain
+        run: |
+          xcodebuild -version
+          xcrun swift --version
       - name: Build ${{ matrix.destination }}
         run: |
           xcodebuild \
