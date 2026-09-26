@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - F 模块（首页 / 一级导航）行为验证
 //
-// 只编译 Foundation 与公共数据契约（源码目标目录之外，不会进入正式 App）。
+// 只编译 Foundation、公共数据契约和连接配置校验（源码目标目录之外，不会进入正式 App）。
 // 覆盖的是业务行为：入口兼容映射、今日概览口径、任务选择、整页唯一主按钮、
 // 娱乐状态机与规则版本绑定、反馈去重、跨午夜休息时段、考试摘要相关性。
 //
@@ -284,9 +284,34 @@ let offlineOverview = StudyHomePresenter.overview(
     planEngineMessage: nil,
     isModelConfigured: false
 )
-expect(offlineOverview.state == .planned, "未配置 API Key 不得把计划状态变成不可用")
-expect(offlineOverview.targetMinutes == 60, "未配置 API Key 不得隐藏本地任务与目标")
-expect(offlineOverview.noticeLine?.contains("未配置 API Key") == true, "未配置 API Key 要有一行说明")
+expect(offlineOverview.state == .planned, "连接未就绪时本地计划状态仍可用")
+expect(offlineOverview.targetMinutes == 60, "连接未就绪时本地目标和任务仍可见")
+expect(offlineOverview.noticeLine?.contains("AI 服务未就绪") == true, "连接未就绪时显示当前 AI 服务提示")
+
+var localAISettings = AppSettings()
+localAISettings.baseURL = "http://localhost:11434/v1"
+localAISettings.model = "qwen-local"
+localAISettings.protocolKind = .openAIChatCompletions
+localAISettings.authMode = .none
+let localAIConfiguration = AIConnectionConfiguration(settings: localAISettings)
+let localAIConnectionReady: Bool
+do {
+    try AIConnectionConfiguration.validate(localAIConfiguration, apiKey: "")
+    localAIConnectionReady = true
+} catch {
+    localAIConnectionReady = false
+}
+let localServiceOverview = StudyHomePresenter.overview(
+    plan: standardPlan,
+    summary: partial,
+    isSemesterConfigured: true,
+    planEngineMessage: nil,
+    isModelConfigured: localAIConnectionReady
+)
+expect(
+    localAIConnectionReady && localServiceOverview.noticeLine?.contains("AI 服务未就绪") != true,
+    "有效且无需鉴权的本地 AI 服务不会被首页误判为未就绪"
+)
 
 let examLine = StudyHomePresenter.examLine(
     goal: ExamGoal(

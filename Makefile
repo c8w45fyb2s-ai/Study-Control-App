@@ -11,7 +11,7 @@ MACOS := $(CONTENTS)/MacOS
 RESOURCES := $(CONTENTS)/Resources
 
 .PHONY: all app run package \
-	verify-ai-plan verify-schedule verify-daily-plan verify-data-layer verify-integration verify-minimum-plan verify-entertainment verify-schedule-store clean
+verify-ai-plan verify-ai-protocols verify-dashboard verify-schedule verify-daily-plan verify-data-layer verify-integration verify-minimum-plan verify-entertainment verify-schedule-store clean
 
 all: app
 
@@ -101,6 +101,20 @@ verify-ai-plan:
 	mkdir -p "$(BUILD_DIR)"
 	swiftc -parse-as-library -module-cache-path "$(BUILD_DIR)/ModuleCache" $(CORE_MODEL_SOURCES) $(MODULE_SOURCES) "script/verify_ai_plan_flow.swift" -o "$(BUILD_DIR)/verify_ai_plan_flow"
 	"$(BUILD_DIR)/verify_ai_plan_flow"
+
+# 四种 AI 请求协议、配置迁移、响应解析、JSON 修复和有界重试的 mock 验证。
+AI_PROTOCOL_SOURCES := $(CORE_MODEL_SOURCES) "$(SOURCE_DIR)/AIProvider.swift" "$(SOURCE_DIR)/AIClient.swift" "$(SOURCE_DIR)/KeychainStore.swift"
+verify-ai-protocols:
+	mkdir -p "$(BUILD_DIR)"
+	swiftc -parse-as-library -module-cache-path "$(BUILD_DIR)/ModuleCache" $(AI_PROTOCOL_SOURCES) "script/verify_ai_protocols.swift" -framework Security -o "$(BUILD_DIR)/verify_ai_protocols"
+	"$(BUILD_DIR)/verify_ai_protocols"
+
+# 首页展示决策、离线可用性与本地无鉴权 AI 连接就绪状态验证。
+DASHBOARD_SOURCES := $(CORE_MODEL_SOURCES) $(MODULE_SOURCES) "$(SOURCE_DIR)/AIProvider.swift" "$(SOURCE_DIR)/StudyHomePresentation.swift"
+verify-dashboard:
+	mkdir -p "$(BUILD_DIR)"
+	swiftc -parse-as-library -module-cache-path "$(BUILD_DIR)/ModuleCache" $(DASHBOARD_SOURCES) "script/verify_dashboard_flow.swift" -o "$(BUILD_DIR)/verify_dashboard_flow"
+	"$(BUILD_DIR)/verify_dashboard_flow"
 
 # 课表与可用时间的纯计算行为测试。
 verify-schedule:

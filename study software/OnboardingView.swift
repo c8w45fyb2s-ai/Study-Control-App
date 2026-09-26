@@ -9,7 +9,10 @@ struct OnboardingView: View {
     @State private var currentStep: OnboardingStep = .welcome
     @State private var apiKeyInput: String = ""
     @State private var baseURL: String = "https://api.deepseek.com"
-    @State private var model: String = "deepseek-v4-flash"
+    @State private var model: String = ""
+    @State private var servicePreset: AIServicePreset = .deepSeek
+    @State private var protocolKind: AIProtocolKind = .openAIChatCompletions
+    @State private var authMode: AIAuthMode = .providerKey
     @State private var showImporter = false
     var onComplete: () -> Void
 
@@ -36,15 +39,17 @@ struct OnboardingView: View {
     private var onboardingValidationMessage: String? {
         guard currentStep == .apiKey else { return nil }
 
-        if trimmedAPIKey.isEmpty {
-            return "请输入 DeepSeek API Key 后继续，或选择暂时跳过。"
-        }
-        if trimmedBaseURL.isEmpty {
-            return "请保留或填写 Base URL。"
-        }
-        if trimmedModel.isEmpty {
-            return "请保留或填写模型名称。"
-        }
+        var draft = AppSettings()
+        draft.baseURL = trimmedBaseURL
+        draft.model = trimmedModel
+        draft.servicePreset = servicePreset
+        draft.protocolKind = protocolKind
+        draft.authMode = authMode
+        do {
+            try AIConnectionConfiguration.validate(AIConnectionConfiguration(settings: draft), apiKey: trimmedAPIKey)
+        } catch AIError.missingAPIKey {
+            return "请输入当前 AI 服务的 API Key，或选择暂时跳过；本地服务可改选无需鉴权。"
+        } catch { return error.localizedDescription }
         return nil
     }
 
@@ -108,7 +113,10 @@ struct OnboardingView: View {
                     OnboardingCredentialPanel(
                         apiKeyInput: $apiKeyInput,
                         baseURL: $baseURL,
-                        model: $model
+                        model: $model,
+                        servicePreset: $servicePreset,
+                        protocolKind: $protocolKind,
+                        authMode: $authMode
                     )
                 }
             }
@@ -262,9 +270,14 @@ struct OnboardingView: View {
 
         // Save API key before moving on
         if currentStep == .apiKey {
-            store.updateSettings(
-                baseURL: trimmedBaseURL, model: trimmedModel, remindersEnabled: true,
-                defaultReminderHour: 9, apiKey: trimmedAPIKey,
+            guard store.updateSettings(
+                baseURL: trimmedBaseURL, model: trimmedModel,
+                servicePreset: servicePreset, protocolKind: protocolKind, authMode: authMode,
+                chatTokenParameter: store.settings.chatTokenParameter,
+                anthropicOutputTokenLimit: store.settings.anthropicOutputTokenLimit,
+                temperature: store.settings.temperature,
+                useNativeJSONMode: store.settings.useNativeJSONMode,
+                remindersEnabled: true, defaultReminderHour: 9, apiKey: trimmedAPIKey,
                 allowModelRequests: true,
                 allowStructuredPlanRequests: true,
                 includePersonalContextInAnswers: true,
@@ -273,7 +286,7 @@ struct OnboardingView: View {
                 maxAnalysisChunkCharacters: store.settings.maxAnalysisChunkCharacters,
                 inputTokenCostPerMillion: store.settings.inputTokenCostPerMillion,
                 outputTokenCostPerMillion: store.settings.outputTokenCostPerMillion
-            )
+            ) else { return }
         }
 
         // Import step opens file picker; completion advances to .done
@@ -511,7 +524,7 @@ private struct OnboardingHeroPanel: View {
         case .welcome:
             return [("目标", "错题到计划", "target"), ("节奏", "每日复习", "calendar"), ("记忆", "长期跟踪", "chart.line.uptrend.xyaxis")]
         case .apiKey:
-            return [("密钥", "钥匙串保存", "lock.fill"), ("端点", "DeepSeek", "network"), ("模式", "个人资料检索", "person.text.rectangle")]
+            return [("密钥", "钥匙串保存", "lock.fill"), ("端点", "当前服务", "network"), ("模式", "个人资料检索", "person.text.rectangle")]
         case .importFirst:
             return [("输入", "资料解析", "doc.text.magnifyingglass"), ("提取", "知识点", "point.3.connected.trianglepath.dotted"), ("生成", "复习任务", "checklist")]
         case .done:
@@ -526,6 +539,9 @@ private struct OnboardingCredentialPanel: View {
     @Binding var apiKeyInput: String
     @Binding var baseURL: String
     @Binding var model: String
+    @Binding var servicePreset: AIServicePreset
+    @Binding var protocolKind: AIProtocolKind
+    @Binding var authMode: AIAuthMode
 
     var body: some View {
         VStack(alignment: .leading, spacing: StudyDesign.Spacing.normal) {
@@ -545,14 +561,40 @@ private struct OnboardingCredentialPanel: View {
                     .overlay(Capsule().stroke(StudyDesign.Colors.success.opacity(0.16), lineWidth: 1))
             }
 
-            OnboardingSecureFieldRow(
-                title: "DeepSeek API Key",
-                text: $apiKeyInput,
-                prompt: "粘贴 API Key",
-                icon: "key.horizontal.fill",
-                tint: StudyDesign.Colors.success,
-                isTechnicalInput: true
-            )
+            Picker("厂商预设", selection: $servicePreset) {
+                ForEach(AIServicePreset.allCases) { preset in Text(preset.label).tag(preset) }
+            }
+            Picker("接口协议", selection: $protocolKind) {
+                ForEach(AIProtocolKind.allCases) { kind in Text(kind.label).tag(kind) }
+            }
+            Button("应用厂商默认地址与协议") {
+                let defaults = servicePreset.defaults
+                protocolKind = defaults.protocolKind
+                baseURL = defaults.baseURL
+                authMode = defaults.authMode
+                if model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model == AIServicePreset.deepSeek.defaults.model {
+                    model = defaults.model
+                }
+            }
+            .font(.caption)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            Picker("鉴权方式", selection: $authMode) {
+                ForEach(AIAuthMode.allCases) { mode in Text(mode.label).tag(mode) }
+            }
+            if authMode == .providerKey {
+                OnboardingSecureFieldRow(
+                    title: "当前 AI 服务 API Key",
+                    text: $apiKeyInput,
+                    prompt: "粘贴 API Key",
+                    icon: "key.horizontal.fill",
+                    tint: StudyDesign.Colors.success,
+                    isTechnicalInput: true
+                )
+            } else {
+                Text("无需鉴权仅适用于本地服务或明确允许匿名访问的服务。")
+                    .font(.caption)
+                    .foregroundStyle(StudyDesign.Colors.warning)
+            }
 
             VStack(alignment: .leading, spacing: StudyDesign.Spacing.tight) {
                 Button {
@@ -571,7 +613,7 @@ private struct OnboardingCredentialPanel: View {
                             Text("高级连接设置")
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(StudyDesign.Colors.labelPrimary)
-                            Text("默认使用 DeepSeek 地址和模型")
+                            Text("设置 API 根地址、模型 ID 和协议参数")
                                 .font(.caption2)
                                 .foregroundStyle(StudyDesign.Colors.labelSecondary)
                         }
@@ -592,7 +634,7 @@ private struct OnboardingCredentialPanel: View {
                     OnboardingTextFieldRow(
                         title: "Base URL",
                         text: $baseURL,
-                        prompt: "https://api.deepseek.com",
+                        prompt: "API 根地址，例如 https://api.openai.com/v1",
                         icon: "network",
                         tint: StudyDesign.Colors.info,
                         isTechnicalInput: true,
@@ -600,9 +642,9 @@ private struct OnboardingCredentialPanel: View {
                     )
 
                     OnboardingTextFieldRow(
-                        title: "模型名称",
+                        title: "模型 ID（手动输入）",
                         text: $model,
-                        prompt: "deepseek-v4-flash",
+                        prompt: "输入服务支持的模型 ID",
                         icon: "brain.head.profile",
                         tint: StudyDesign.Colors.secondary,
                         isTechnicalInput: true
@@ -641,6 +683,9 @@ private struct OnboardingCredentialPanel: View {
         }
         .help("填写模型连接信息")
         .accessibilityElement(children: .contain)
+        .onChange(of: baseURL) { _, _ in apiKeyInput = "" }
+        .onChange(of: protocolKind) { _, _ in apiKeyInput = "" }
+        .onChange(of: authMode) { _, _ in apiKeyInput = "" }
     }
 }
 

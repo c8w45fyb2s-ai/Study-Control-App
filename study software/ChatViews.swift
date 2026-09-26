@@ -23,16 +23,14 @@ struct ChatView: View {
         store.snapshot.settings.allowModelRequests
     }
 
-    private var hasAPIKey: Bool {
-        !store.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
+    private var hasAIConnection: Bool { store.isAIConnectionReady }
 
     private var modelUnavailableMessage: String? {
         if !allowModelRequests {
             return "AI 请求已关闭，开启后才能发送问题。"
         }
-        if !hasAPIKey {
-            return "请先配置 API Key 后再发送问题。"
+        if !hasAIConnection {
+            return "请先配置当前 AI 服务的协议、地址、模型和鉴权方式。"
         }
         return nil
     }
@@ -56,7 +54,7 @@ struct ChatView: View {
                 referenceCount: store.chatContexts.count,
                 includesPersonalContext: store.snapshot.settings.includePersonalContextInAnswers,
                 allowModelRequests: allowModelRequests,
-                hasAPIKey: hasAPIKey,
+                hasAPIKey: hasAIConnection,
                 answerMode: store.snapshot.settings.answerMode,
                 isBusy: store.isBusy,
                 activeRequestTitle: store.activeAIRequestTitle
@@ -366,9 +364,9 @@ private struct ChatWorkbenchHeader: View {
             return "AI 请求已关闭"
         }
         if !hasAPIKey {
-            return "待配置 API Key"
+            return "AI 服务未就绪"
         }
-        return "模型就绪"
+        return "AI 服务已配置"
     }
 
     private var statusIcon: String {

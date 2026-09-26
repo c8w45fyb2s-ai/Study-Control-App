@@ -160,7 +160,7 @@ struct DashboardView: View {
 
     private var isModelConfigured: Bool {
         store.snapshot.settings.allowModelRequests
-            && !store.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && store.isAIConnectionReady
     }
 
     private var nextSteps: StudyHomeNextSteps {
@@ -507,7 +507,7 @@ private struct DashboardSetupSecondaryAction: View {
                 setupStep(
                     number: 1,
                     title: "连接模型",
-                    detail: "在设置中开启模型并填写 API Key",
+                    detail: "在设置中配置协议、API 根地址、模型 ID 和鉴权方式",
                     icon: "key.fill",
                     tint: StudyDesign.Colors.info
                 )
@@ -2758,7 +2758,7 @@ struct DashboardHeroBanner: View {
 
     private enum HeroWorkflowState {
         case modelDisabled
-        case missingAPIKey
+        case connectionNotReady
         case waitingDrafts(Int)
         case checkedIn
         case dueReviews
@@ -2829,8 +2829,8 @@ struct DashboardHeroBanner: View {
             return .modelDisabled
         }
 
-        if store.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return .missingAPIKey
+        if !store.isAIConnectionReady {
+            return .connectionNotReady
         }
 
         let draftCount = store.snapshot.drafts.count + store.snapshot.pendingAIPlanDrafts.count
@@ -2868,8 +2868,8 @@ struct DashboardHeroBanner: View {
         switch workflowState {
         case .modelDisabled:
             return "先开启模型请求"
-        case .missingAPIKey:
-            return "先配置 API Key"
+        case .connectionNotReady:
+            return "先配置 AI 服务连接"
         case .waitingDrafts(let count):
             return "有 \(count) 个结果待确认"
         case .checkedIn:
@@ -2891,8 +2891,8 @@ struct DashboardHeroBanner: View {
         switch workflowState {
         case .modelDisabled:
             return "资料分析和答疑现在不会调用模型，开启后才能继续 AI 流程。"
-        case .missingAPIKey:
-            return "配置后才能分析资料、生成计划和答疑。"
+        case .connectionNotReady:
+            return "配置协议、API 根地址、模型 ID 和鉴权方式后可分析资料、生成计划和答疑。"
         case .waitingDrafts:
             return "确认后会沉淀为知识点、错题和复习任务。"
         case .checkedIn:
@@ -2912,7 +2912,7 @@ struct DashboardHeroBanner: View {
 
     private var primaryAction: HeroPrimaryAction {
         switch workflowState {
-        case .modelDisabled, .missingAPIKey:
+        case .modelDisabled, .connectionNotReady:
             return HeroPrimaryAction(
                 title: "去设置",
                 icon: "gearshape.fill",
@@ -2997,7 +2997,7 @@ struct DashboardHeroBanner: View {
 
     private var heroAccentColor: Color {
         switch workflowState {
-        case .modelDisabled, .missingAPIKey:
+        case .modelDisabled, .connectionNotReady:
             return StudyDesign.Colors.info
         case .waitingDrafts:
             return StudyDesign.Colors.secondary

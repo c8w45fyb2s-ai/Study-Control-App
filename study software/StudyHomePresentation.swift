@@ -481,7 +481,7 @@ enum StudyHomePresenter {
             lines.append("今天的时间比原计划少，已自动减量为轻量计划。")
         }
         if !isModelConfigured {
-            lines.append("未配置 API Key：本地任务照常执行，AI 分析与答疑暂不可用。")
+            lines.append("当前 AI 服务未就绪：本地任务照常执行，AI 分析与答疑暂不可用。")
         }
         return lines.isEmpty ? nil : lines.joined(separator: "\n")
     }

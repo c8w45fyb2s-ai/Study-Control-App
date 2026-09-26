@@ -22,10 +22,10 @@ enum StoreChangeResult: Equatable, Sendable {
 @MainActor
 final class AppStore: ObservableObject {
     @Published private(set) var snapshot = StoreSnapshot()
-    @Published var apiKey: String = KeychainStore.loadAPIKey()
+    @Published var apiKey: String = ""
     /// Unsaved settings draft lives above SettingsView so navigating away does not
     /// discard a partially entered key. It is never written outside Keychain until save.
-    @Published var settingsDraftAPIKey: String = KeychainStore.loadAPIKey()
+    @Published var settingsDraftAPIKey: String = ""
     @Published var statusMessage = "准备就绪"
     @Published var isBusy = false
     @Published var selectedDraftID: UUID?
@@ -43,6 +43,8 @@ final class AppStore: ObservableObject {
     /// 注入独立目录，绝不读写用户真实的 `store.json`。
     let environment: StudyRuntimeEnvironment
     private let persistence: SnapshotFileStore?
+    private let underlyingAITransport: (any AIHTTPTransporting)?
+    private let keychainStore: any AIKeychainStoring
     /// 存储初始化失败的原因。`nil` 表示初始化成功。
     ///
     /// 刻意不吞掉：`try?` 会让"存储不可用"退化成"静默不保存还提示成功"。
@@ -54,6 +56,7 @@ final class AppStore: ObservableObject {
     private var lastKnownTimeZoneIdentifier: String
     private var lastSavedStoreURLDescription: String
     private var isHandlingForegroundActivation = false
+    private var activeCredentialScope = ""
 
     /// 上一次成功落盘的快照。旧写入路径写盘失败时回滚到它，
     /// 避免出现"内存已改、磁盘没改、界面提示成功"的分裂状态。
@@ -82,11 +85,21 @@ final class AppStore: ObservableObject {
     private let chatCompressionCharacterThreshold = 16_000
 
     convenience init() {
-        self.init(environment: StudyRuntimeEnvironment.resolve())
+        self.init(environment: StudyRuntimeEnvironment.resolve(), keychainStore: SystemAIKeychainStore())
     }
 
-    init(environment: StudyRuntimeEnvironment) {
+    convenience init(keychainStore: any AIKeychainStoring) {
+        self.init(environment: StudyRuntimeEnvironment.resolve(), keychainStore: keychainStore)
+    }
+
+    convenience init(environment: StudyRuntimeEnvironment, underlyingAITransport: (any AIHTTPTransporting)? = nil) {
+        self.init(environment: environment, underlyingAITransport: underlyingAITransport, keychainStore: SystemAIKeychainStore())
+    }
+
+    init(environment: StudyRuntimeEnvironment, underlyingAITransport: (any AIHTTPTransporting)? = nil, keychainStore: any AIKeychainStoring) {
         self.environment = environment
+        self.underlyingAITransport = underlyingAITransport
+        self.keychainStore = keychainStore
         self.coordinator = StudyPlanCoordinator(engines: StudyEngineRegistry.production())
 
         var store: SnapshotFileStore?
@@ -102,6 +115,15 @@ final class AppStore: ObservableObject {
         self.lastKnownTimeZoneIdentifier = TimeZone.current.identifier
         self.lastSavedStoreURLDescription = environment.storeLocation.storeURL.path
         load()
+        let initialConnection = AIConnectionConfiguration(settings: snapshot.settings)
+        activeCredentialScope = initialConnection.credentialScope
+        let canMigrateLegacyCredential = snapshot.settings.legacyCredentialMigrationPending
+        apiKey = keychainStore.loadAPIKey(for: initialConnection, allowLegacyFallback: canMigrateLegacyCredential)
+        settingsDraftAPIKey = apiKey
+        if canMigrateLegacyCredential && keychainStore.hasScopedCredential(for: initialConnection) {
+            snapshot.settings.legacyCredentialMigrationPending = false
+            _ = save()
+        }
 
         if let initializationError {
             // 存储不可用时必须让用户看到，而不是"看起来一切正常但什么都没保存"。
@@ -197,6 +219,16 @@ final class AppStore: ObservableObject {
 
     var settings: AppSettings {
         snapshot.settings
+    }
+
+    var isAIConnectionReady: Bool {
+        let configuration = AIConnectionConfiguration(settings: snapshot.settings)
+        do {
+            try AIConnectionConfiguration.validate(configuration, apiKey: apiKey)
+            return true
+        } catch {
+            return false
+        }
     }
 
     var selectedDraft: AnalysisDraft? {
@@ -317,6 +349,13 @@ final class AppStore: ObservableObject {
     func updateSettings(
         baseURL: String,
         model: String,
+        servicePreset: AIServicePreset,
+        protocolKind: AIProtocolKind,
+        authMode: AIAuthMode,
+        chatTokenParameter: AIChatTokenParameter,
+        anthropicOutputTokenLimit: Int?,
+        temperature: Double?,
+        useNativeJSONMode: Bool,
         remindersEnabled: Bool,
         defaultReminderHour: Int,
         apiKey: String,
@@ -328,33 +367,100 @@ final class AppStore: ObservableObject {
         maxAnalysisChunkCharacters: Int,
         inputTokenCostPerMillion: Double,
         outputTokenCostPerMillion: Double
-    ) {
-        let wasRemindersEnabled = snapshot.settings.remindersEnabled
-        snapshot.settings.baseURL = baseURL
-        snapshot.settings.model = model
-        snapshot.settings.remindersEnabled = remindersEnabled
-        snapshot.settings.defaultReminderHour = min(max(defaultReminderHour, 0), 23)
-        snapshot.settings.allowModelRequests = allowModelRequests
-        snapshot.settings.allowStructuredPlanRequests = allowStructuredPlanRequests
-        snapshot.settings.includePersonalContextInAnswers = includePersonalContextInAnswers
-        snapshot.settings.keepDocumentContent = keepDocumentContent
-        snapshot.settings.answerMode = answerMode
-        snapshot.settings.maxAnalysisChunkCharacters = min(max(maxAnalysisChunkCharacters, 2_000), 24_000)
-        snapshot.settings.inputTokenCostPerMillion = max(inputTokenCostPerMillion, 0)
-        snapshot.settings.outputTokenCostPerMillion = max(outputTokenCostPerMillion, 0)
+    ) -> Bool {
+        let oldRemindersEnabled = snapshot.settings.remindersEnabled
+        var candidate = snapshot
+        candidate.settings.baseURL = baseURL
+        candidate.settings.model = model
+        candidate.settings.servicePreset = servicePreset
+        candidate.settings.protocolKind = protocolKind
+        candidate.settings.authMode = authMode
+        candidate.settings.legacyCredentialMigrationPending = false
+        candidate.settings.chatTokenParameter = chatTokenParameter
+        candidate.settings.anthropicOutputTokenLimit = anthropicOutputTokenLimit.map { min(max($0, 1), 128_000) }
+        candidate.settings.temperature = temperature
+        candidate.settings.useNativeJSONMode = useNativeJSONMode
+        candidate.settings.remindersEnabled = remindersEnabled
+        candidate.settings.defaultReminderHour = min(max(defaultReminderHour, 0), 23)
+        candidate.settings.allowModelRequests = allowModelRequests
+        candidate.settings.allowStructuredPlanRequests = allowStructuredPlanRequests
+        candidate.settings.includePersonalContextInAnswers = includePersonalContextInAnswers
+        candidate.settings.keepDocumentContent = keepDocumentContent
+        candidate.settings.answerMode = answerMode
+        candidate.settings.maxAnalysisChunkCharacters = min(max(maxAnalysisChunkCharacters, 2_000), 24_000)
+        candidate.settings.inputTokenCostPerMillion = max(inputTokenCostPerMillion, 0)
+        candidate.settings.outputTokenCostPerMillion = max(outputTokenCostPerMillion, 0)
+
+        let connection = AIConnectionConfiguration(settings: candidate.settings)
+        do {
+            try AIConnectionConfiguration.validateForSaving(connection)
+        } catch {
+            statusMessage = "设置未保存：\(error.localizedDescription)"
+            recordEvent(.error, "AI 服务设置校验失败：\(error.localizedDescription)", shouldSave: false)
+            return false
+        }
+
+        // Local preferences do not need Keychain access when the connection and
+        // credential are unchanged (including an unconfigured, offline install).
+        var previousCredentialState: AIKeychainCredentialState?
+        if connection.credentialScope != activeCredentialScope || apiKey != self.apiKey {
+            do {
+                previousCredentialState = try keychainStore.credentialState(for: connection)
+            } catch {
+                statusMessage = "无法读取当前连接的 Keychain 凭据，设置未保存：\(error.localizedDescription)"
+                recordEvent(.error, "读取 AI 服务密钥失败：\(error.localizedDescription)", shouldSave: false)
+                return false
+            }
+
+            do {
+                try keychainStore.saveAPIKey(apiKey, for: connection)
+            } catch {
+                do {
+                    if let previousCredentialState {
+                        try keychainStore.restoreCredentialState(previousCredentialState, for: connection)
+                    }
+                    statusMessage = "AI 服务密钥保存失败，设置未更改：\(error.localizedDescription)"
+                    recordEvent(.error, "保存 AI 服务密钥失败：\(error.localizedDescription)", shouldSave: false)
+                } catch {
+                    statusMessage = "AI 服务密钥保存失败，设置未更改；且旧密钥恢复失败：\(error.localizedDescription)"
+                    recordEvent(.error, "保存 AI 服务密钥失败且恢复旧密钥失败：\(error.localizedDescription)", shouldSave: false)
+                }
+                return false
+            }
+        }
+
+        // 把本次成功事件放进候选快照一起写盘。失败诊断由 persist 以 shouldSave:false
+        // 记录，避免保存流程中的诊断再次隐式触发一次写盘。
+        candidate.diagnosticEvents.insert(
+            AppDiagnosticEvent(level: .info, message: "AI 服务设置已保存"),
+            at: 0
+        )
+        if candidate.diagnosticEvents.count > 80 {
+            candidate.diagnosticEvents = Array(candidate.diagnosticEvents.prefix(80))
+        }
+        let normalizedCandidate = candidate.normalizedToCurrentSchema()
+        guard persist(normalizedCandidate, rollbackOnFailure: false) else {
+            do {
+                if let previousCredentialState {
+                    try keychainStore.restoreCredentialState(previousCredentialState, for: connection)
+                }
+                statusMessage = "设置未保存，仍使用旧连接。\(storageErrorMessage ?? "本地存储写入失败。")"
+            } catch {
+                let storageFailure = storageErrorMessage ?? "本地存储写入失败。"
+                statusMessage = "设置未保存，仍使用旧连接；但 Keychain 中候选密钥恢复失败：\(error.localizedDescription) 设置写盘错误：\(storageFailure)"
+                recordEvent(.error, "设置写盘失败后恢复旧密钥失败：\(error.localizedDescription)", shouldSave: false)
+            }
+            return false
+        }
+
+        // 只有 Keychain 与快照都成功后，才一起发布新的运行时连接状态。
+        snapshot = normalizedCandidate
         self.apiKey = apiKey
         settingsDraftAPIKey = apiKey
-        do {
-            try KeychainStore.saveAPIKey(apiKey)
-            statusMessage = "设置已保存"
-            recordEvent(.info, "设置已保存")
-        } catch {
-            statusMessage = error.localizedDescription
-            recordEvent(.error, "保存 Keychain API Key 失败：\(error.localizedDescription)")
-        }
-        guard save() else { return }
+        activeCredentialScope = connection.credentialScope
+        statusMessage = "设置已保存"
 
-        if wasRemindersEnabled != remindersEnabled {
+        if oldRemindersEnabled != remindersEnabled {
             if remindersEnabled {
                 // 首次启用提醒时才请求系统权限；普通刷新不会再弹窗。
                 Task {
@@ -370,6 +476,8 @@ final class AppStore: ObservableObject {
         } else if remindersEnabled {
             reschedulePendingNotifications()
         }
+
+        return true
     }
 
     // MARK: - 计划重新评估（自动触发）
@@ -1057,6 +1165,10 @@ final class AppStore: ObservableObject {
                     statusMessage = "已关闭 AI 请求：请在隐私设置中开启后再分析"
                     return
                 }
+                guard isAIConnectionReady else {
+                    statusMessage = "当前 AI 服务尚未就绪：请在设置中补全连接配置后再分析。"
+                    return
+                }
 
                 for (index, document) in documents.enumerated() {
                     statusMessage = "正在分析 \(index + 1)/\(documents.count)：\(document.title)"
@@ -1349,6 +1461,7 @@ final class AppStore: ObservableObject {
                 return
             }
             snapshot = loaded.snapshot
+            refreshAIConnectionCredentialIfNeeded()
             refreshIterativeAIPlans(updateStatus: false)
             if !silently {
                 statusMessage = "已刷新本地数据"
@@ -1370,6 +1483,7 @@ final class AppStore: ObservableObject {
             }
             guard var imported = try persistence?.importSnapshot(from: url) else { return }
             imported = imported.normalizedToCurrentSchema()
+            imported.settings.legacyCredentialMigrationPending = false
             imported.diagnosticEvents.insert(AppDiagnosticEvent(level: .info, message: "从备份导入数据"), at: 0)
             Task {
                 let saved = await commit(imported, status: "已导入备份", reminderChanges: [], now: Date())
@@ -1393,6 +1507,7 @@ final class AppStore: ObservableObject {
                 return
             }
             recovered = recovered.normalizedToCurrentSchema()
+            recovered.settings.legacyCredentialMigrationPending = false
             recovered.diagnosticEvents.insert(
                 AppDiagnosticEvent(level: .warning, message: "从备份 #\(index) (\(label)) 还原数据"),
                 at: 0
@@ -1487,7 +1602,7 @@ final class AppStore: ObservableObject {
         chatQuestion = ""
         guard save() else { return }
         startAIRequest("正在检索个人资料...") {
-            await self.runBusy("正在检索个人资料...") { [self] in
+            await self.runBusy("正在检索个人资料...", showsChatResponseOnRefusal: true) { [self] in
                 if let patch = AIPlanPatchEngine.makeRuleBasedPatch(command: question, snapshot: snapshot) {
                     var assistantMessage = ChatHistoryMessage(role: .assistant, content: "")
                     let result = applyAIPlanPatch(
@@ -1509,6 +1624,10 @@ final class AppStore: ObservableObject {
                     statusMessage = "已关闭 AI 请求：请在隐私设置中开启后再提问"
                     return
                 }
+                guard isAIConnectionReady else {
+                    statusMessage = "当前 AI 服务尚未就绪：请在设置中补全连接配置后再提问。"
+                    return
+                }
                 chatAnswer = ""
                 chatContexts = []
                 refreshIterativeAIPlans(updateStatus: false)
@@ -1522,11 +1641,12 @@ final class AppStore: ObservableObject {
                     statusMessage = "隐私设置已关闭个人资料引用，正在生成通用解释..."
                 }
                 let studyState = makeChatStudyStateContext()
-                let chatPromptContext = await makeCompressedChatPromptContext(
+                let chatPromptContext = try await makeCompressedChatPromptContext(
                     from: previousChatMessages,
                     studyState: studyState
                 )
-                let result = try await makeClient().answer(
+                let client = try makeClient()
+                let result = try await client.answer(
                     question: question,
                     context: shouldUseContext ? retrieval.promptContext : "",
                     studyState: studyState,
@@ -1534,7 +1654,7 @@ final class AppStore: ObservableObject {
                     compressedContextSummary: chatPromptContext.summary,
                     answerMode: snapshot.settings.answerMode
                 )
-                recordUsage(result.usage)
+                recordUsage(result.usage, pricing: client.pricing)
                 let contextCharCount = shouldUseContext ? retrieval.promptContext.count : 0
                 let truncatedNote = contextCharCount > 30_000 ? "\n\n（部分个人资料因长度限制已截断）" : ""
                 let citations = shouldUseContext ? retrieval.citations : []
@@ -1545,7 +1665,7 @@ final class AppStore: ObservableObject {
                 if snapshot.settings.allowStructuredPlanRequests,
                    AIPlanDraftIntent.shouldAttempt(question: question, answer: result.answer) {
                     statusMessage = "正在整理可确认的规划草稿..."
-                    if let planDraft = await makeAIPlanDraftIfPossible(
+                   if let planDraft = try await makeAIPlanDraftIfPossible(
                         question: question,
                         answer: result.answer,
                         context: shouldUseContext ? retrieval.promptContext : "",
@@ -1572,8 +1692,11 @@ final class AppStore: ObservableObject {
         }
     }
 
-    private func makeClient() -> DeepSeekClient {
-        DeepSeekClient(apiKey: apiKey, baseURL: snapshot.settings.baseURL, model: snapshot.settings.model)
+    func makeClient() throws -> AIClient {
+        guard snapshot.settings.allowModelRequests else {
+            throw AIError.invalidConfiguration("已关闭模型请求：当前操作不会发送到 AI 服务。")
+        }
+        return try AIClientFactory.make(settings: snapshot.settings, apiKey: apiKey, underlyingTransport: underlyingAITransport)
     }
 
     // MARK: - Chat History
@@ -1730,23 +1853,26 @@ final class AppStore: ObservableObject {
         studyState: String,
         sourceUserMessageID: UUID,
         sourceAssistantMessageID: UUID
-    ) async -> AIPlanDraft? {
+    ) async throws -> AIPlanDraft? {
         do {
             let planTemplate = planTemplateForCurrentGoal(question: question, answer: answer)
-            let result = try await makeClient().makeAIPlanDraft(
+            let client = try makeClient()
+            let result = try await client.makeAIPlanDraft(
                 question: question,
                 answer: answer,
                 context: context,
                 studyState: studyState,
                 planTemplate: planTemplate
             )
-            recordUsage(result.usage)
+            recordUsage(result.usage, pricing: client.pricing)
             return makeAIPlanDraft(
                 from: result.payload,
                 planTemplate: planTemplate,
                 sourceUserMessageID: sourceUserMessageID,
                 sourceAssistantMessageID: sourceAssistantMessageID
             )
+        } catch let refusal as AIModelRefusal {
+            throw refusal
         } catch {
             recordEvent(.warning, "AI 规划草稿结构化失败：\(error.localizedDescription)")
             return nil
@@ -1804,7 +1930,7 @@ final class AppStore: ObservableObject {
     }
 
     private func makeAIPlanDraft(
-        from payload: DeepSeekAIPlanPayload,
+        from payload: AIPlanPayload,
         planTemplate: AIPlanTemplate,
         sourceUserMessageID: UUID,
         sourceAssistantMessageID: UUID
@@ -1885,7 +2011,7 @@ final class AppStore: ObservableObject {
     private func makeCompressedChatPromptContext(
         from chatHistory: [ChatHistoryMessage],
         studyState: String
-    ) async -> ChatPromptContext {
+    ) async throws -> ChatPromptContext {
         if snapshot.chatContextSummaryMessageCount > chatHistory.count {
             snapshot.chatContextSummary = ""
             snapshot.chatMemorySummary = ChatMemorySummary()
@@ -1923,12 +2049,13 @@ final class AppStore: ObservableObject {
         statusMessage = "正在压缩较早的对话上下文..."
 
         do {
-            let result = try await makeClient().compressChatContext(
+            let client = try makeClient()
+            let result = try await client.compressChatContext(
                 existingMemory: effectiveMemory,
                 messages: messagesToCompress,
                 studyState: studyState
             )
-            recordUsage(result.usage)
+            recordUsage(result.usage, pricing: client.pricing)
             snapshot.chatContextSummary = result.summary
             snapshot.chatMemorySummary = result.memory
             snapshot.chatContextSummaryMessageCount = targetSummaryCount
@@ -1940,6 +2067,8 @@ final class AppStore: ObservableObject {
                 summary: snapshot.chatMemorySummary.promptText,
                 recentMessages: Array(chatHistory.suffix(keepRecentCount))
             )
+        } catch let refusal as AIModelRefusal {
+            throw refusal
         } catch {
             recordEvent(.warning, "自动压缩对话上下文失败，已改用近期原文上下文：\(error.localizedDescription)")
             return ChatPromptContext(
@@ -2326,17 +2455,22 @@ final class AppStore: ObservableObject {
             statusMessage = "已关闭 AI 请求：资料已保存，未发送给模型分析"
             return
         }
+        guard isAIConnectionReady else {
+            statusMessage = "当前 AI 服务尚未就绪：资料已保存，请在设置中补全连接配置。"
+            return
+        }
         let chunks = makeAnalysisChunks(from: content)
         statusMessage = "正在准备分析：\(document.title)"
+        let client = try makeClient()
 
-        var payloads: [DeepSeekAnalysisPayload] = []
+        var payloads: [AIAnalysisPayload] = []
         for (index, chunk) in chunks.enumerated() {
             try Task.checkCancellation()
             statusMessage = chunks.count == 1
                 ? "正在分析：\(document.title)"
                 : "正在分析 \(index + 1)/\(chunks.count)：\(document.title)"
-            let result = try await makeClient().analyze(content: chunk, kind: kind)
-            recordUsage(result.usage)
+            let result = try await client.analyze(content: chunk, kind: kind)
+            recordUsage(result.usage, pricing: client.pricing)
             payloads.append(result.payload)
         }
         let mergedPayload = mergeAnalysisPayloads(payloads)
@@ -2364,19 +2498,19 @@ final class AppStore: ObservableObject {
         return chunks
     }
 
-    private func mergeAnalysisPayloads(_ payloads: [DeepSeekAnalysisPayload]) -> DeepSeekAnalysisPayload {
+    private func mergeAnalysisPayloads(_ payloads: [AIAnalysisPayload]) -> AIAnalysisPayload {
         guard !payloads.isEmpty else {
-            return DeepSeekAnalysisPayload(summary: "暂无分析结果。", knowledgePoints: [], mistakes: [], reviewItems: [])
+            return AIAnalysisPayload(summary: "暂无分析结果。", knowledgePoints: [], mistakes: [], reviewItems: [])
         }
 
-        var knowledgeByTitle: [String: DeepSeekKnowledgePoint] = [:]
-        var mistakesByQuestion: [String: DeepSeekMistake] = [:]
-        var reviewItemsByTitle: [String: DeepSeekReviewItem] = [:]
+        var knowledgeByTitle: [String: AIKnowledgePoint] = [:]
+        var mistakesByQuestion: [String: AIMistake] = [:]
+        var reviewItemsByTitle: [String: AIReviewItem] = [:]
 
         for payload in payloads {
             for point in payload.knowledgePoints where !point.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 if let existing = knowledgeByTitle[point.title] {
-                    knowledgeByTitle[point.title] = DeepSeekKnowledgePoint(
+                    knowledgeByTitle[point.title] = AIKnowledgePoint(
                         title: point.title,
                         subject: point.subject ?? existing.subject,
                         summary: [existing.summary, point.summary].filter { !$0.isEmpty }.joined(separator: "；"),
@@ -2400,7 +2534,7 @@ final class AppStore: ObservableObject {
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
 
-        return DeepSeekAnalysisPayload(
+        return AIAnalysisPayload(
             summary: summary.isEmpty ? "已完成分块分析。" : summary,
             knowledgePoints: Array(knowledgeByTitle.values).sorted { $0.title < $1.title },
             mistakes: Array(mistakesByQuestion.values).sorted { $0.question < $1.question },
@@ -2408,7 +2542,7 @@ final class AppStore: ObservableObject {
         )
     }
 
-    private func makeDraft(from payload: DeepSeekAnalysisPayload, sourceDocumentID: UUID) -> AnalysisDraft {
+    private func makeDraft(from payload: AIAnalysisPayload, sourceDocumentID: UUID) -> AnalysisDraft {
         let knowledgePoints = payload.knowledgePoints.map {
             DraftKnowledgePoint(
                 title: $0.title,
@@ -2467,7 +2601,11 @@ final class AppStore: ObservableObject {
             .replacingOccurrences(of: " ", with: "")
     }
 
-    private func runBusy(_ message: String, operation: @escaping () async throws -> Void) async {
+    private func runBusy(
+        _ message: String,
+        showsChatResponseOnRefusal: Bool = false,
+        operation: @escaping () async throws -> Void
+    ) async {
         isBusy = true
         activeAIRequestTitle = message
         statusMessage = message
@@ -2480,6 +2618,17 @@ final class AppStore: ObservableObject {
             try await operation()
         } catch is CancellationError {
             statusMessage = "已取消当前 AI 请求"
+        } catch let refusal as AIModelRefusal {
+            recordAIRefusalUsage(refusal)
+            statusMessage = refusal.errorDescription ?? "当前 AI 服务拒绝了请求。"
+            recordEvent(.warning, statusMessage, shouldSave: false)
+            if showsChatResponseOnRefusal {
+                chatAnswer = refusal.message
+                if snapshot.chatMessages.last?.role == .user {
+                    snapshot.chatMessages.append(ChatHistoryMessage(role: .assistant, content: refusal.message))
+                    save()
+                }
+            }
         } catch {
             statusMessage = error.localizedDescription
             recordEvent(.error, error.localizedDescription)
@@ -2611,10 +2760,23 @@ final class AppStore: ObservableObject {
         let normalized = candidate.normalizedToCurrentSchema()
         guard persist(normalized, rollbackOnFailure: false) else { return false }
         snapshot = normalized
+        refreshAIConnectionCredentialIfNeeded()
         if !status.isEmpty {
             statusMessage = status
         }
         return true
+    }
+
+    private func refreshAIConnectionCredentialIfNeeded() {
+        let configuration = AIConnectionConfiguration(settings: snapshot.settings)
+        guard configuration.credentialScope != activeCredentialScope else { return }
+        activeCredentialScope = configuration.credentialScope
+        apiKey = keychainStore.loadAPIKey(for: configuration, allowLegacyFallback: false)
+        settingsDraftAPIKey = apiKey
+    }
+
+    func loadAPIKey(for configuration: AIConnectionConfiguration) -> String {
+        keychainStore.loadAPIKey(for: configuration, allowLegacyFallback: false)
     }
 
     /// 应用协调器产出的通知意图。失败只记录，不影响已提交的数据。
@@ -3391,14 +3553,18 @@ final class AppStore: ObservableObject {
         recordEvent(.info, "完成错题：\(ReviewPlanner.shortTitle(mistake.question))")
     }
 
-    private func recordUsage(_ usage: DeepSeekUsage?) {
+    func recordAIRefusalUsage(_ refusal: AIModelRefusal) {
+        recordUsage(refusal.usage, pricing: refusal.pricing)
+    }
+
+    private func recordUsage(_ usage: AIUsage?, pricing: AIUsagePricing) {
         guard let usage else { return }
         snapshot.usageStats.requestCount += 1
         snapshot.usageStats.inputTokens += usage.inputTokens
         snapshot.usageStats.outputTokens += usage.outputTokens
         snapshot.usageStats.estimatedCost +=
-            Double(usage.inputTokens) / 1_000_000 * snapshot.settings.inputTokenCostPerMillion +
-            Double(usage.outputTokens) / 1_000_000 * snapshot.settings.outputTokenCostPerMillion
+            Double(usage.inputTokens) / 1_000_000 * pricing.inputPerMillion +
+            Double(usage.outputTokens) / 1_000_000 * pricing.outputPerMillion
         snapshot.usageStats.lastUpdated = Date()
         guard save() else { return }
     }
@@ -3531,11 +3697,11 @@ final class AppStore: ObservableObject {
         let mistakeIDs = Set(snapshot.mistakes.map(\.id))
 
         if snapshot.settings.baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            issues.append("DeepSeek Base URL 为空")
+            issues.append("AI 服务 Base URL 为空")
         }
 
         if snapshot.settings.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            issues.append("DeepSeek 模型名为空")
+            issues.append("AI 服务模型 ID 为空")
         }
 
         if !(0...23).contains(snapshot.settings.defaultReminderHour) {

@@ -295,7 +295,7 @@ struct IOSMoreView: View {
 
     private var hasModelSetupIssue: Bool {
         !store.snapshot.settings.allowModelRequests
-            || store.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !store.isAIConnectionReady
     }
 
     private var hasLearningAssets: Bool {
@@ -328,7 +328,7 @@ struct IOSMoreView: View {
                                 } label: {
                                     IOSMorePriorityBanner(
                                         title: "完成模型设置",
-                                        subtitle: store.snapshot.settings.allowModelRequests ? "配置 API Key 后才能分析和答疑" : "开启模型请求后才能继续 AI 流程",
+                                        subtitle: store.snapshot.settings.allowModelRequests ? "配置当前 AI 服务后才能分析和答疑" : "开启模型请求后才能继续 AI 流程",
                                         icon: "key.fill",
                                         tint: StudyDesign.Colors.info
                                     )

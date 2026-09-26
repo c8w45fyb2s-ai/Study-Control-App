@@ -1291,7 +1291,7 @@ struct FileImportReviewCard: View {
         .buttonStyle(StudyActionPillButtonStyle(tint: importKind.libraryTint, minWidth: 100))
         .disabled(isBusy)
         .help(isBusy ? "当前正在处理资料，完成后再开始分析。" : "开始分析这份资料")
-        .accessibilityHint(isBusy ? "当前正在处理资料，完成后再开始分析。" : "将上传文件到 DeepSeek 进行分析")
+        .accessibilityHint(isBusy ? "当前正在处理资料，完成后再开始分析。" : "将所选资料发送到当前 AI 服务进行分析")
     }
 }
 

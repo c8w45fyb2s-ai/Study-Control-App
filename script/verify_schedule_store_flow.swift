@@ -1,5 +1,97 @@
 import Foundation
 
+private actor RequestCountingTransport: AIHTTPTransporting {
+    private var requestCount = 0
+
+    func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        requestCount += 1
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+        return (Data(), response)
+    }
+
+    func count() -> Int { requestCount }
+}
+
+@MainActor
+private final class MockAIKeychainStore: AIKeychainStoring {
+    private var credentials: [String: AIKeychainCredentialState] = [:]
+    private(set) var failNextSave = false
+    private(set) var failNextRestore = false
+    private(set) var credentialReadCount = 0
+    private(set) var credentialSaveCount = 0
+    private(set) var credentialRestoreCount = 0
+
+    func loadAPIKey(for configuration: AIConnectionConfiguration, allowLegacyFallback: Bool) -> String {
+        credentials[configuration.credentialScope]?.apiKey ?? ""
+    }
+
+    func credentialState(for configuration: AIConnectionConfiguration) throws -> AIKeychainCredentialState {
+        credentialReadCount += 1
+        return credentials[configuration.credentialScope] ?? AIKeychainCredentialState(apiKey: nil, migrationMarker: nil)
+    }
+
+    func saveAPIKey(_ value: String, for configuration: AIConnectionConfiguration) throws {
+        credentialSaveCount += 1
+        if failNextSave {
+            failNextSave = false
+            credentials[configuration.credentialScope] = AIKeychainCredentialState(
+                apiKey: value.isEmpty ? nil : value,
+                migrationMarker: "migrated"
+            )
+            throw MockError.injected("mock credential save failure")
+        }
+        credentials[configuration.credentialScope] = AIKeychainCredentialState(
+            apiKey: value.isEmpty ? nil : value,
+            migrationMarker: "migrated"
+        )
+    }
+
+    func restoreCredentialState(_ state: AIKeychainCredentialState, for configuration: AIConnectionConfiguration) throws {
+        credentialRestoreCount += 1
+        if failNextRestore {
+            failNextRestore = false
+            throw MockError.injected("mock credential restore failure")
+        }
+        credentials[configuration.credentialScope] = state
+    }
+
+    func hasScopedCredential(for configuration: AIConnectionConfiguration) -> Bool {
+        credentials[configuration.credentialScope]?.apiKey != nil
+    }
+
+    func setFailNextSave() { failNextSave = true }
+    func setFailNextRestore() { failNextRestore = true }
+    func hasCredential(for configuration: AIConnectionConfiguration) -> Bool {
+        credentials[configuration.credentialScope]?.apiKey != nil
+    }
+
+    private enum MockError: LocalizedError {
+        case injected(String)
+        var errorDescription: String? {
+            if case .injected(let message) = self { return message }
+            return nil
+        }
+    }
+}
+
+private actor RequestObservingTransport: AIHTTPTransporting {
+    private var captured: [URLRequest] = []
+    private let responseBody: String
+
+    init(responseBody: String = #"{"choices":[{"finish_reason":"stop","message":{"content":"OK"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#) {
+        self.responseBody = responseBody
+    }
+
+    func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        captured.append(request)
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+        return (Data(responseBody.utf8), response)
+    }
+
+    func lastRequest() -> URLRequest? { captured.last }
+    func count() -> Int { captured.count }
+}
+
 /// AppStore 与课表编辑保存结果的隔离集成测试。
 @main
 struct ScheduleStoreVerifyHarness {
@@ -17,10 +109,16 @@ struct ScheduleStoreVerifyHarness {
     }
 
     @MainActor
-    static func main() {
+    static func main() async {
+        await verifyModelRequestPrivacyGate()
+        await verifyOfflineSettingsCanBeSaved()
+        await verifySettingsCredentialTransactions()
+        await verifyModelRefusalStopsAnalysis()
+        await verifyMemoryRefusalStopsChat()
+
         // 默认初始化也必须在测试隔离模式中运行；Makefile 为该进程设置独立目录与 TEST_MODE。
         if StudyRuntimeEnvironment.resolve().isTestMode {
-            let defaultStore = AppStore()
+            let defaultStore = AppStore(keychainStore: MockAIKeychainStore())
             let defaultStoreDirectory = defaultStore.environment.storeLocation.directory
             defer { try? FileManager.default.removeItem(at: defaultStoreDirectory) }
             check(defaultStore.environment.isIsolatedStore, "默认 AppStore 初始化使用隔离测试目录")
@@ -54,7 +152,7 @@ struct ScheduleStoreVerifyHarness {
                 storeLocation: location,
                 storeLocationOrigin: "schedule-store-verify"
             )
-            let store = AppStore(environment: environment)
+            let store = AppStore(environment: environment, keychainStore: MockAIKeychainStore())
             check(store.environment.isTestMode, "显式注入环境保留测试隔离模式")
             checkEqual(store.environment.storeLocation.directory, location.directory, "显式注入环境使用指定隔离目录")
             let originalTemplates = store.snapshot.schedulePeriodTemplates
@@ -165,7 +263,7 @@ struct ScheduleStoreVerifyHarness {
                 allowsSystemNotifications: false,
                 storeLocation: manualLocation,
                 storeLocationOrigin: "manual-task-store-verify"
-            ))
+            ), keychainStore: MockAIKeychainStore())
             let manualNow = Date(timeIntervalSince1970: 1_790_000_000)
             let manualContext = PlanningContext(now: manualNow, timeZoneIdentifier: "Asia/Shanghai")
             let firstManualTask = ManualStudyTask(
@@ -273,7 +371,7 @@ struct ScheduleStoreVerifyHarness {
                 allowsSystemNotifications: false,
                 storeLocation: rewardRecheckLocation,
                 storeLocationOrigin: "manual-task-reward-recheck-verify"
-            ))
+            ), keychainStore: MockAIKeychainStore())
             checkEqual(rewardRecheckStore.snapshot.rewardGrant(id: manualRewardGrant.id)?.state, .pending, "隔离测试初始奖励为待领取")
             rewardRecheckStore.deleteManualStudyTask(id: rewardedTask.id, now: manualNow)
             checkEqual(rewardRecheckStore.snapshot.rewardGrant(id: manualRewardGrant.id)?.state, .revoked, "删除手动任务时立即重查并撤销已失效的待用奖励")
@@ -330,7 +428,7 @@ struct ScheduleStoreVerifyHarness {
                 storeLocation: rewardLocation,
                 storeLocationOrigin: "reward-recheck-verify"
             )
-            let rewardStore = AppStore(environment: rewardEnvironment)
+            let rewardStore = AppStore(environment: rewardEnvironment, keychainStore: MockAIKeychainStore())
             rewardStore.setEntertainmentRuleEnabled(id: rewardRule.id, isEnabled: false, now: rewardNow)
             checkEqual(rewardStore.snapshot.rewardGrant(id: rewardGrant.id)?.state, .revoked, "停用规则后 AppStore 当次提交立即撤销未使用奖励")
             checkEqual(
@@ -360,7 +458,7 @@ struct ScheduleStoreVerifyHarness {
                 allowsSystemNotifications: false,
                 storeLocation: deletionLocation,
                 storeLocationOrigin: "reward-rule-delete-verify"
-            ))
+            ), keychainStore: MockAIKeychainStore())
             deletionStore.deleteEntertainmentRule(id: rewardRule.id, now: rewardNow)
             checkEqual(deletionStore.snapshot.rewardGrant(id: rewardGrant.id)?.state, .revoked, "删除规则后 AppStore 当次提交立即撤销未使用奖励")
             let reloadedDeletionSnapshot = try SnapshotFileStore(location: deletionLocation).load()
@@ -375,6 +473,309 @@ struct ScheduleStoreVerifyHarness {
 
         print("Schedule store verification complete. passed=\(passed) failed=\(failed)")
         if failed > 0 { exit(1) }
+    }
+
+    @MainActor
+    private static func verifyModelRequestPrivacyGate() async {
+        let location = SnapshotStoreLocation.isolatedTemporary(prefix: "AIRequestPrivacyVerify")
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+
+        do {
+            var seed = StoreSnapshot()
+            seed.settings.allowModelRequests = false
+            seed.settings.baseURL = "https://mock.example/v1"
+            seed.settings.model = "mock-model"
+            try SnapshotFileStore(location: location).save(seed)
+
+            let transport = RequestCountingTransport()
+            let environment = StudyRuntimeEnvironment(
+                isTestMode: true,
+                allowsSystemNotifications: false,
+                storeLocation: location,
+                storeLocationOrigin: "ai-request-privacy-verify"
+            )
+            let store = AppStore(environment: environment, underlyingAITransport: transport, keychainStore: MockAIKeychainStore())
+            store.apiKey = "mock-key"
+            store.chatQuestion = "请解释光合作用的基本过程。"
+            store.askQuestion()
+
+            for _ in 0..<100 {
+                if !store.hasActiveAIRequest { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+
+            checkEqual(await transport.count(), 0, "关闭模型请求时答疑不会发起网络调用")
+            checkEqual(store.statusMessage, "已关闭 AI 请求：请在隐私设置中开启后再提问", "隐私开关向用户说明请求已拦截")
+        } catch {
+            check(false, "AI 请求隐私开关验证准备失败：\(error)")
+        }
+    }
+
+    @MainActor
+    private static func verifyOfflineSettingsCanBeSaved() async {
+        let location = SnapshotStoreLocation.isolatedTemporary(prefix: "OfflineSettingsSaveVerify")
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+        let keychain = MockAIKeychainStore()
+        let transport = RequestCountingTransport()
+        let store = AppStore(
+            environment: StudyRuntimeEnvironment(
+                isTestMode: true,
+                allowsSystemNotifications: false,
+                storeLocation: location,
+                storeLocationOrigin: "offline-settings-save-verify"
+            ),
+            underlyingAITransport: transport,
+            keychainStore: keychain
+        )
+        let baseURL = store.settings.baseURL
+        check(saveTestSettings(store, baseURL: baseURL, model: "", apiKey: "", allowModelRequests: false, includePersonalContext: false), "没有模型和密钥也能保存关闭 AI、提醒和个人资料引用")
+        check(!store.settings.allowModelRequests && !store.settings.remindersEnabled && !store.settings.includePersonalContextInAnswers, "离线设置当次保存后生效")
+        check(!store.isAIConnectionReady, "保存离线设置不会把未配置的 AI 连接标为就绪")
+        checkEqual(keychain.credentialReadCount, 0, "只改本地偏好无需读取 Keychain 凭据事务")
+        checkEqual(keychain.credentialSaveCount, 0, "只改本地偏好无需写入 Keychain")
+        do {
+            let reloaded = try SnapshotFileStore(location: location).load()
+            check(reloaded?.settings.allowModelRequests == false && reloaded?.settings.remindersEnabled == false && reloaded?.settings.includePersonalContextInAnswers == false, "离线设置写盘后可完整回读")
+        } catch {
+            check(false, "离线设置回读失败：\(error)")
+        }
+
+        check(saveTestSettings(store, baseURL: baseURL, model: "test-model", apiKey: "", allowModelRequests: true), "即使 AI 开关打开，也允许保存未填密钥的配置")
+        do {
+            _ = try store.makeClient()
+            check(false, "缺少密钥时不能创建请求客户端")
+        } catch AIError.missingAPIKey {
+            check(true, "实际请求仍校验必需的密钥")
+        } catch {
+            check(false, "缺少密钥时返回了意外错误：\(error)")
+        }
+        store.chatQuestion = "解释光合作用。"
+        store.askQuestion()
+        for _ in 0..<100 {
+            if !store.hasActiveAIRequest { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        checkEqual(await transport.count(), 0, "保存和使用不完整连接都不会发出网络请求")
+        check(saveTestSettings(store, baseURL: "", model: "", apiKey: "", allowModelRequests: false), "完全未配置 AI 的离线状态可以保存")
+        check(!store.settings.allowModelRequests && !store.isAIConnectionReady, "空连接保存后保持 AI 关闭且未就绪")
+    }
+
+    @MainActor
+    private static func verifySettingsCredentialTransactions() async {
+        let location = SnapshotStoreLocation.isolatedTemporary(prefix: "AISettingsCredentialTransactionVerify")
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+
+        do {
+            let environment = StudyRuntimeEnvironment(
+                isTestMode: true,
+                allowsSystemNotifications: false,
+                storeLocation: location,
+                storeLocationOrigin: "ai-settings-credential-transaction-verify"
+            )
+            let keychain = MockAIKeychainStore()
+            let transport = RequestObservingTransport()
+            let store = AppStore(environment: environment, underlyingAITransport: transport, keychainStore: keychain)
+
+            check(saveTestSettings(store, baseURL: "https://old.example/proxy/v1", model: "old-model", apiKey: "old-key"), "初始连接设置和凭据原子保存")
+            await checkCurrentRequest(store, transport, baseURL: "https://old.example/proxy/v1/chat/completions", apiKey: "Bearer old-key", message: "已保存连接请求使用旧地址和旧密钥")
+
+            keychain.setFailNextSave()
+            check(!saveTestSettings(store, baseURL: "https://switched.example/v1", model: "switched-model", apiKey: "switched-key"), "Keychain 写入失败会拒绝服务切换")
+            checkEqual(keychain.credentialRestoreCount, 1, "凭据写入失败只由设置事务回滚一次")
+            checkEqual(store.snapshot.settings.baseURL, "https://old.example/proxy/v1", "Keychain 失败后设置地址仍是旧值")
+            checkEqual(store.snapshot.settings.model, "old-model", "Keychain 失败后模型仍是旧值")
+            checkEqual(store.apiKey, "old-key", "Keychain 失败后运行密钥仍是旧值")
+            checkEqual(store.settingsDraftAPIKey, "old-key", "Keychain 失败后草稿密钥仍是旧值")
+            let persistedAfterKeychainFailure = try SnapshotFileStore(location: location).load()
+            checkEqual(persistedAfterKeychainFailure?.settings.baseURL, "https://old.example/proxy/v1", "Keychain 失败没有隐式写入候选地址")
+            check(
+                !(persistedAfterKeychainFailure?.diagnosticEvents.contains { $0.message.contains("保存 AI 服务密钥失败") } ?? false),
+                "Keychain 失败诊断没有触发额外隐式保存"
+            )
+            await checkCurrentRequest(store, transport, baseURL: "https://old.example/proxy/v1/chat/completions", apiKey: "Bearer old-key", message: "服务切换的 Keychain 失败后请求仍使用旧连接")
+
+            try Data("{\"schemaVersion\":999}".utf8).write(to: location.storeURL, options: .atomic)
+            check(!saveTestSettings(store, baseURL: "https://old.example/proxy/v1", model: "same-scope-new-model", apiKey: "replacement-key"), "设置写盘失败会拒绝发布候选配置")
+            let oldConfiguration = AIConnectionConfiguration(settings: store.snapshot.settings)
+            checkEqual(keychain.loadAPIKey(for: oldConfiguration, allowLegacyFallback: false), "old-key", "同一连接写盘失败后 Keychain 原密钥已恢复")
+            checkEqual(store.snapshot.settings.model, "old-model", "同一连接写盘失败后内存配置仍旧")
+            checkEqual(store.apiKey, "old-key", "同一连接写盘失败后运行密钥仍旧")
+            checkEqual(store.settingsDraftAPIKey, "old-key", "同一连接写盘失败后草稿密钥仍旧")
+            await checkCurrentRequest(store, transport, baseURL: "https://old.example/proxy/v1/chat/completions", apiKey: "Bearer old-key", message: "同一连接写盘失败后请求地址和密钥保持匹配")
+
+            let switchedConfiguration = AIConnectionConfiguration(
+                baseURL: "https://disk-failed-switch.example/v1",
+                model: "disk-failed-model",
+                protocolKind: .openAIChatCompletions,
+                authMode: .providerKey,
+                chatTokenParameter: .maxTokens,
+                anthropicOutputTokenLimit: 128,
+                temperature: nil,
+                useNativeJSONMode: false
+            )
+            check(!saveTestSettings(store, baseURL: switchedConfiguration.baseURL, model: switchedConfiguration.model, apiKey: "disk-failed-key"), "切換服務時快照寫盤失敗會回滚候选连接密钥")
+            check(!keychain.hasCredential(for: switchedConfiguration), "切換服務寫盤失敗後新地址沒有留下候選密鑰")
+            checkEqual(store.snapshot.settings.baseURL, "https://old.example/proxy/v1", "切換服务写盘失败后仍绑定旧地址")
+            checkEqual(store.apiKey, "old-key", "切换服务写盘失败后仍绑定旧密钥")
+            await checkCurrentRequest(store, transport, baseURL: "https://old.example/proxy/v1/chat/completions", apiKey: "Bearer old-key", message: "切换服务写盘失败后后续请求仍使用旧地址和旧密钥")
+
+            keychain.setFailNextRestore()
+            check(!saveTestSettings(store, baseURL: "https://old.example/proxy/v1", model: "restore-failed-model", apiKey: "restore-failed-key"), "Keychain 恢复失败时设置仍不会发布")
+            check(store.statusMessage.contains("恢复失败"), "Keychain 恢复失败会向用户明确报告")
+            checkEqual(store.snapshot.settings.baseURL, "https://old.example/proxy/v1", "密钥恢复失败时运行地址仍是旧值")
+            checkEqual(store.apiKey, "old-key", "密钥恢复失败时本次进程仍用旧密钥")
+            await checkCurrentRequest(store, transport, baseURL: "https://old.example/proxy/v1/chat/completions", apiKey: "Bearer old-key", message: "密钥恢复失败后本次进程请求仍使用旧连接")
+        } catch {
+            check(false, "AI 设置凭据事务测试准备失败：\(error)")
+        }
+    }
+
+    @MainActor
+    private static func verifyModelRefusalStopsAnalysis() async {
+        let location = SnapshotStoreLocation.isolatedTemporary(prefix: "AIRefusalAnalysisVerify")
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+
+        let transport = RequestObservingTransport(responseBody: #"{"choices":[{"finish_reason":"stop","message":{"refusal":"我不能分析这份内容。","content":null}}],"usage":{"prompt_tokens":12,"completion_tokens":5}}"#)
+        let environment = StudyRuntimeEnvironment(
+            isTestMode: true,
+            allowsSystemNotifications: false,
+            storeLocation: location,
+            storeLocationOrigin: "ai-refusal-analysis-verify"
+        )
+        let store = AppStore(environment: environment, underlyingAITransport: transport, keychainStore: MockAIKeychainStore())
+        check(saveTestSettings(store, baseURL: "https://refusal.example/v1", model: "refusal-model", apiKey: "mock-key"), "拒绝响应测试连接保存成功")
+
+        let document = StudyDocument(title: "拒绝测试资料", sourceName: "mock.txt", kind: .note, content: "待分析内容")
+        store.analyzeDocument(document)
+        for _ in 0..<100 {
+            if !store.hasActiveAIRequest { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+
+        let requestCount = await transport.count()
+        checkEqual(requestCount, 1, "资料分析收到首个拒绝响应后只发送一次请求")
+        check(store.snapshot.drafts.isEmpty, "模型拒绝后没有生成资料分析草稿")
+        check(store.snapshot.aiPlanDrafts.isEmpty, "模型拒绝后没有生成规划草稿")
+        checkEqual(store.snapshot.usageStats.requestCount, 1, "拒绝响应 usage 仍计为一次模型请求")
+        checkEqual(store.snapshot.usageStats.inputTokens, 12, "拒绝响应输入 token 被计入用量")
+        checkEqual(store.snapshot.usageStats.outputTokens, 5, "拒绝响应输出 token 被计入用量")
+        check(store.statusMessage.contains("我不能分析这份内容。"), "拒绝说明直接显示在用户状态中")
+
+        let chatLocation = SnapshotStoreLocation.isolatedTemporary(prefix: "AIRefusalChatVerify")
+        defer { try? FileManager.default.removeItem(at: chatLocation.directory) }
+        let chatTransport = RequestObservingTransport(responseBody: #"{"choices":[{"finish_reason":"stop","message":{"refusal":"我不能帮助制定这类计划。","content":null}}],"usage":{"prompt_tokens":8,"completion_tokens":3}}"#)
+        let chatStore = AppStore(
+            environment: StudyRuntimeEnvironment(
+                isTestMode: true,
+                allowsSystemNotifications: false,
+                storeLocation: chatLocation,
+                storeLocationOrigin: "ai-refusal-chat-verify"
+            ),
+            underlyingAITransport: chatTransport,
+            keychainStore: MockAIKeychainStore()
+        )
+        check(saveTestSettings(chatStore, baseURL: "https://refusal.example/v1", model: "refusal-model", apiKey: "mock-key"), "答疑拒绝测试连接保存成功")
+        chatStore.chatQuestion = "请帮我制定一个学习计划。"
+        chatStore.askQuestion()
+        for _ in 0..<100 {
+            if !chatStore.hasActiveAIRequest { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        let chatRequestCount = await chatTransport.count()
+        checkEqual(chatRequestCount, 1, "答疑收到拒绝后不会再生成规划草稿")
+        checkEqual(chatStore.chatAnswer, "我不能帮助制定这类计划。", "答疑直接展示模型拒绝说明")
+        check(chatStore.snapshot.aiPlanDrafts.isEmpty, "答疑拒绝不会创建 AI 计划草稿")
+        checkEqual(chatStore.snapshot.usageStats.requestCount, 1, "答疑拒绝的 usage 被记录")
+    }
+
+    @MainActor
+    private static func verifyMemoryRefusalStopsChat() async {
+        let location = SnapshotStoreLocation.isolatedTemporary(prefix: "AIMemoryRefusalVerify")
+        defer { try? FileManager.default.removeItem(at: location.directory) }
+
+        var seed = StoreSnapshot()
+        seed.chatMessages = (0..<20).map { index in
+            ChatHistoryMessage(
+                role: index.isMultiple(of: 2) ? .user : .assistant,
+                content: String(repeating: "以前讨论过数学复习与练习方法。", count: 80)
+            )
+        }
+        do {
+            try SnapshotFileStore(location: location).save(seed)
+        } catch {
+            check(false, "长期记忆拒绝测试准备失败：\(error)")
+            return
+        }
+
+        let transport = RequestObservingTransport(responseBody: #"{"choices":[{"finish_reason":"stop","message":{"refusal":"我不能压缩这段对话。","content":null}}],"usage":{"prompt_tokens":6,"completion_tokens":4}}"#)
+        let store = AppStore(
+            environment: StudyRuntimeEnvironment(
+                isTestMode: true,
+                allowsSystemNotifications: false,
+                storeLocation: location,
+                storeLocationOrigin: "ai-memory-refusal-verify"
+            ),
+            underlyingAITransport: transport,
+            keychainStore: MockAIKeychainStore()
+        )
+        check(saveTestSettings(store, baseURL: "https://refusal.example/v1", model: "refusal-model", apiKey: "mock-key"), "长期记忆拒绝测试连接保存成功")
+        store.chatQuestion = "如何开始复习比较好？"
+        store.askQuestion()
+        for _ in 0..<100 {
+            if !store.hasActiveAIRequest { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+
+        let requestCount = await transport.count()
+        checkEqual(requestCount, 1, "长期记忆压缩拒绝后不会继续发送答疑请求")
+        checkEqual(store.snapshot.chatContextSummaryMessageCount, 0, "长期记忆拒绝不会提交压缩摘要")
+        checkEqual(store.chatAnswer, "我不能压缩这段对话。", "长期记忆拒绝说明直接展示给用户")
+        checkEqual(store.snapshot.usageStats.inputTokens, 6, "长期记忆拒绝的输入 token 计入用量")
+        checkEqual(store.snapshot.usageStats.outputTokens, 4, "长期记忆拒绝的输出 token 计入用量")
+    }
+
+    @MainActor
+    private static func saveTestSettings(_ store: AppStore, baseURL: String, model: String, apiKey: String, allowModelRequests: Bool = true, includePersonalContext: Bool? = nil) -> Bool {
+        let current = store.settings
+        return store.updateSettings(
+            baseURL: baseURL,
+            model: model,
+            servicePreset: .custom,
+            protocolKind: .openAIChatCompletions,
+            authMode: .providerKey,
+            chatTokenParameter: current.chatTokenParameter,
+            anthropicOutputTokenLimit: current.anthropicOutputTokenLimit,
+            temperature: nil,
+            useNativeJSONMode: false,
+            remindersEnabled: false,
+            defaultReminderHour: current.defaultReminderHour,
+            apiKey: apiKey,
+            allowModelRequests: allowModelRequests,
+            allowStructuredPlanRequests: current.allowStructuredPlanRequests,
+            includePersonalContextInAnswers: includePersonalContext ?? current.includePersonalContextInAnswers,
+            keepDocumentContent: current.keepDocumentContent,
+            answerMode: current.answerMode,
+            maxAnalysisChunkCharacters: current.maxAnalysisChunkCharacters,
+            inputTokenCostPerMillion: current.inputTokenCostPerMillion,
+            outputTokenCostPerMillion: current.outputTokenCostPerMillion
+        )
+    }
+
+    @MainActor
+    private static func checkCurrentRequest(
+        _ store: AppStore,
+        _ transport: RequestObservingTransport,
+        baseURL: String,
+        apiKey: String,
+        message: String
+    ) async {
+        do {
+            try await store.makeClient().testConnection()
+            let request = await transport.lastRequest()
+            check(request?.url?.absoluteString == baseURL && request?.value(forHTTPHeaderField: "Authorization") == apiKey, message)
+        } catch {
+            check(false, "\(message)：mock 请求失败：\(error.localizedDescription)")
+        }
     }
 
     static func checkEqual<T: Equatable>(_ actual: T, _ expected: T, _ message: String) {

@@ -704,9 +704,6 @@ private struct KeyboardDismissTapView: UIViewRepresentable {
             true
         }
 
-        deinit {
-            uninstall()
-        }
     }
 }
 #endif

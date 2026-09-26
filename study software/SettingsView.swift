@@ -12,6 +12,14 @@ struct SettingsView: View {
     @EnvironmentObject private var store: AppStore
     @SceneStorage("settings.draft.baseURL") private var baseURL = ""
     @SceneStorage("settings.draft.model") private var model = ""
+    @SceneStorage("settings.draft.servicePreset") private var servicePresetRaw = AIServicePreset.deepSeek.rawValue
+    @SceneStorage("settings.draft.protocolKind") private var protocolKindRaw = AIProtocolKind.openAIChatCompletions.rawValue
+    @SceneStorage("settings.draft.authMode") private var authModeRaw = AIAuthMode.providerKey.rawValue
+    @SceneStorage("settings.draft.chatTokenParameter") private var chatTokenParameterRaw = AIChatTokenParameter.maxTokens.rawValue
+    @SceneStorage("settings.draft.anthropicOutputLimitText") private var anthropicOutputTokenLimitText = "4096"
+    @SceneStorage("settings.draft.useAnthropicOutputLimit") private var useAnthropicOutputLimit = false
+    @SceneStorage("settings.draft.temperature") private var temperatureText = ""
+    @SceneStorage("settings.draft.useNativeJSONMode") private var useNativeJSONMode = false
     @SceneStorage("settings.draft.remindersEnabled") private var remindersEnabled = true
     @SceneStorage("settings.draft.defaultReminderHour") private var defaultReminderHour = 9
     @SceneStorage("settings.draft.allowModelRequests") private var allowModelRequests = true
@@ -129,6 +137,14 @@ struct SettingsView: View {
             guard !hasLoadedSettingsDraft else { return }
             baseURL = store.settings.baseURL
             model = store.settings.model
+            servicePresetRaw = store.settings.servicePreset.rawValue
+            protocolKindRaw = store.settings.protocolKind.rawValue
+            authModeRaw = store.settings.authMode.rawValue
+            chatTokenParameterRaw = store.settings.chatTokenParameter.rawValue
+            useAnthropicOutputLimit = store.settings.anthropicOutputTokenLimit != nil
+            anthropicOutputTokenLimitText = String(store.settings.anthropicOutputTokenLimit ?? AIOutputBudget.documentAnalysis)
+            temperatureText = store.settings.temperature.map { String($0) } ?? ""
+            useNativeJSONMode = store.settings.useNativeJSONMode
             store.settingsDraftAPIKey = store.apiKey
             remindersEnabled = store.settings.remindersEnabled
             defaultReminderHour = store.settings.defaultReminderHour
@@ -143,6 +159,9 @@ struct SettingsView: View {
             outputTokenCostPerMillion = store.settings.outputTokenCostPerMillion
             hasLoadedSettingsDraft = true
         }
+        .onChange(of: trimmedBaseURL) { _, _ in refreshDraftCredentialForConnectionChange() }
+        .onChange(of: protocolKindRaw) { _, _ in refreshDraftCredentialForConnectionChange() }
+        .onChange(of: authModeRaw) { _, _ in refreshDraftCredentialForConnectionChange() }
     }
 
     private var trimmedBaseURL: String {
@@ -153,22 +172,64 @@ struct SettingsView: View {
         model.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private var servicePreset: AIServicePreset { AIServicePreset(rawValue: servicePresetRaw) ?? .custom }
+    private var protocolKind: AIProtocolKind { AIProtocolKind(rawValue: protocolKindRaw) ?? .openAIChatCompletions }
+    private var authMode: AIAuthMode { AIAuthMode(rawValue: authModeRaw) ?? .providerKey }
+    private var chatTokenParameter: AIChatTokenParameter { AIChatTokenParameter(rawValue: chatTokenParameterRaw) ?? .maxTokens }
+    private var parsedTemperature: Double? {
+        let cleaned = temperatureText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? nil : Double(cleaned)
+    }
+    private var parsedAnthropicOutputTokenLimit: Int? {
+        guard useAnthropicOutputLimit else { return nil }
+        return Int(anthropicOutputTokenLimitText.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private var draftAppSettings: AppSettings {
+        var value = store.settings
+        value.baseURL = trimmedBaseURL
+        value.model = trimmedModelName
+        value.servicePreset = servicePreset
+        value.protocolKind = protocolKind
+        value.authMode = authMode
+        value.chatTokenParameter = chatTokenParameter
+        value.anthropicOutputTokenLimit = parsedAnthropicOutputTokenLimit
+        value.temperature = parsedTemperature
+        value.useNativeJSONMode = useNativeJSONMode
+        return value
+    }
+
+    private func refreshDraftCredentialForConnectionChange() {
+        guard hasLoadedSettingsDraft else { return }
+        let configuration = AIConnectionConfiguration(settings: draftAppSettings)
+        store.settingsDraftAPIKey = store.loadAPIKey(for: configuration)
+        connectionTestState = .idle
+    }
+
     private var settingsValidationMessage: String? {
-        guard
-            let url = URL(string: trimmedBaseURL),
-            let scheme = url.scheme?.lowercased(),
-            (scheme == "https" || scheme == "http"),
-            let host = url.host,
-            !host.isEmpty
-        else {
-            return "Base URL 需要是完整的 http 或 https 地址。"
-        }
+        do {
+            try AIConnectionConfiguration.validateForSaving(AIConnectionConfiguration(settings: draftAppSettings))
+            if !temperatureText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               parsedTemperature == nil {
+                return "temperature 必须是 0 到 2 之间的数字，或留空。"
+            }
+            if useAnthropicOutputLimit,
+               parsedAnthropicOutputTokenLimit == nil || !(1...128_000).contains(parsedAnthropicOutputTokenLimit ?? 0) {
+                return "Anthropic 最大输出预算需要填写 1 到 128000 之间的整数，或关闭自定义预算使用业务默认值。"
+            }
+            return nil
+        } catch { return error.localizedDescription }
+    }
 
-        if trimmedModelName.isEmpty {
-            return "模型名称不能为空。"
-        }
-
-        return nil
+    private var connectionValidationMessage: String? {
+        if let settingsValidationMessage { return settingsValidationMessage }
+        do {
+            try AIConnectionConfiguration.validate(
+                AIConnectionConfiguration(settings: draftAppSettings),
+                apiKey: store.settingsDraftAPIKey
+            )
+            return nil
+        } catch { return error.localizedDescription }
     }
 
     private var settingsSaveHelp: String {
@@ -184,6 +245,13 @@ struct SettingsView: View {
     private var hasSettingsChanges: Bool {
         trimmedBaseURL != store.settings.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         || trimmedModelName != store.settings.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        || servicePreset != store.settings.servicePreset
+        || protocolKind != store.settings.protocolKind
+        || authMode != store.settings.authMode
+        || chatTokenParameter != store.settings.chatTokenParameter
+        || parsedAnthropicOutputTokenLimit != store.settings.anthropicOutputTokenLimit
+        || parsedTemperature != store.settings.temperature
+        || useNativeJSONMode != store.settings.useNativeJSONMode
         || store.settingsDraftAPIKey != store.apiKey
         || remindersEnabled != store.settings.remindersEnabled
         || defaultReminderHour != store.settings.defaultReminderHour
@@ -313,19 +381,74 @@ struct SettingsView: View {
 
                 if showModelConnection {
                     VStack(spacing: StudyDesign.Spacing.tight) {
-                        SettingsTextFieldRow(title: "Base URL", text: $baseURL, prompt: "https://api.deepseek.com")
+                        Picker("厂商预设", selection: $servicePresetRaw) {
+                            ForEach(AIServicePreset.allCases) { preset in Text(preset.label).tag(preset.rawValue) }
+                        }
+                        Picker("接口协议", selection: $protocolKindRaw) {
+                            ForEach(AIProtocolKind.allCases) { kind in Text(kind.label).tag(kind.rawValue) }
+                        }
+                        Button("应用厂商默认地址与协议") { applySelectedServicePreset() }
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                            .accessibilityHint("厂商预设只填充默认地址、协议和鉴权方式，可继续修改全部字段。")
+
+                        Picker("鉴权方式", selection: $authModeRaw) {
+                            ForEach(AIAuthMode.allCases) { mode in Text(mode.label).tag(mode.rawValue) }
+                        }
+                        SettingsTextFieldRow(title: "Base URL（API 根地址）", text: $baseURL, prompt: "例如 https://api.openai.com/v1")
                             .settingsURLInputBehavior()
-                        SettingsTextFieldRow(title: "模型", text: $model, prompt: "deepseek-v4-flash")
+                        Text("输入 API 根地址，可保留代理路径前缀；不要填写密钥。若粘贴了完整接口地址，应用会移除已知接口路径。")
+                            .font(.caption)
+                            .foregroundStyle(StudyDesign.Colors.labelSecondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        SettingsTextFieldRow(title: "模型 ID", text: $model, prompt: "手动输入服务支持的模型 ID")
                             .settingsPlainTextInputBehavior()
-                        SettingsSecureFieldRow(title: "API Key", text: $store.settingsDraftAPIKey, prompt: "仅保存在 Keychain")
+                        if authMode == .providerKey {
+                            SettingsSecureFieldRow(title: "API Key", text: $store.settingsDraftAPIKey, prompt: "仅保存在 Keychain")
+                                .settingsPlainTextInputBehavior()
+                        } else {
+                            Text("已明确选择无需鉴权；仅用于本地服务或你信任且允许无鉴权的端点。")
+                                .font(.caption)
+                                .foregroundStyle(StudyDesign.Colors.warning)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        if protocolKind == .openAIChatCompletions {
+                            Picker("输出长度参数", selection: $chatTokenParameterRaw) {
+                                ForEach(AIChatTokenParameter.allCases) { item in Text(item.label).tag(item.rawValue) }
+                            }
+                        }
+                        if protocolKind == .anthropicMessages {
+                            Toggle("自定义最大输出预算", isOn: $useAnthropicOutputLimit)
+                            if useAnthropicOutputLimit {
+                                SettingsTextFieldRow(title: "Anthropic 最大输出预算（tokens）", text: $anthropicOutputTokenLimitText, prompt: "例如 16000")
+#if os(iOS)
+                                    .keyboardType(.numberPad)
+#endif
+                                    .settingsPlainTextInputBehavior()
+                                Text("这是每次请求允许生成的最大输出 token 数，不保证模型一定输出这么长。")
+                                    .font(.caption)
+                                    .foregroundStyle(StudyDesign.Colors.labelSecondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            } else {
+                                Text("未设置时，按答疑、资料分析、计划和记忆压缩等业务使用各自的默认输出预算。")
+                                    .font(.caption)
+                                    .foregroundStyle(StudyDesign.Colors.labelSecondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        SettingsTextFieldRow(title: "temperature（可选）", text: $temperatureText, prompt: "留空使用服务默认值")
                             .settingsPlainTextInputBehavior()
+                        if protocolKind != .anthropicMessages {
+                            Toggle("请求原生 JSON 输出模式", isOn: $useNativeJSONMode)
+                                .disabled(!(protocolKind == .openAIChatCompletions || protocolKind == .openAIResponses || protocolKind == .geminiGenerateContent))
+                                .accessibilityHint("仅对支持此能力的接口发送 JSON 模式参数；关闭后仍使用提示词、解析和一次修复。")
+                        }
                         if let settingsValidationMessage {
                             Label(settingsValidationMessage, systemImage: "exclamationmark.triangle")
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(StudyDesign.Colors.warning)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        Text("API Key 仅保存在系统 Keychain。")
+                        Text("API Key 仅保存在与接口协议和服务地址绑定的系统 Keychain 项目中，不写入备份。")
                             .font(.caption)
                             .foregroundStyle(StudyDesign.Colors.labelSecondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -340,8 +463,8 @@ struct SettingsView: View {
                                 )
                             }
                             .buttonStyle(StudyActionPillButtonStyle(tint: StudyDesign.Colors.info, prominence: .secondary, minWidth: 108))
-                            .disabled(connectionTestState == .running || settingsValidationMessage != nil || store.settingsDraftAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                            .accessibilityHint("使用当前端点、模型和 API Key 发送最小连接测试。")
+                            .disabled(connectionTestState == .running || connectionValidationMessage != nil)
+                            .accessibilityHint("使用当前未保存的协议、地址、模型和鉴权方式发送真实的最小生成请求。")
 
                             if connectionTestState != .idle {
                                 modelConnectionTestResult
@@ -355,9 +478,16 @@ struct SettingsView: View {
     }
 
     private func saveSettings() {
-        store.updateSettings(
+        guard store.updateSettings(
             baseURL: trimmedBaseURL,
             model: trimmedModelName,
+            servicePreset: servicePreset,
+            protocolKind: protocolKind,
+            authMode: authMode,
+            chatTokenParameter: chatTokenParameter,
+            anthropicOutputTokenLimit: parsedAnthropicOutputTokenLimit,
+            temperature: parsedTemperature,
+            useNativeJSONMode: useNativeJSONMode,
             remindersEnabled: remindersEnabled,
             defaultReminderHour: defaultReminderHour,
             apiKey: store.settingsDraftAPIKey,
@@ -369,30 +499,41 @@ struct SettingsView: View {
             maxAnalysisChunkCharacters: maxAnalysisChunkCharacters,
             inputTokenCostPerMillion: inputTokenCostPerMillion,
             outputTokenCostPerMillion: outputTokenCostPerMillion
-        )
+        ) else { return }
         connectionTestState = .idle
     }
 
     private func testModelConnection() {
-        guard settingsValidationMessage == nil else { return }
+        guard connectionValidationMessage == nil else { return }
         let key = store.settingsDraftAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else {
-            connectionTestState = .failure("请先填写 API Key")
-            return
-        }
 
         connectionTestState = .running
         Task {
             do {
-                let client = DeepSeekClient(apiKey: key, baseURL: trimmedBaseURL, model: trimmedModelName)
+                let client = try AIClientFactory.make(settings: draftAppSettings, apiKey: key)
                 try await client.testConnection()
                 connectionTestState = .success
                 StudyAccessibility.announce("模型连接成功")
             } catch {
+                if let refusal = error as? AIModelRefusal {
+                    store.recordAIRefusalUsage(refusal)
+                }
                 connectionTestState = .failure(error.localizedDescription)
                 StudyAccessibility.announce("模型连接失败：\(error.localizedDescription)")
             }
         }
+    }
+
+    private func applySelectedServicePreset() {
+        let oldDefaults = store.settings.servicePreset.defaults
+        let defaults = servicePreset.defaults
+        protocolKindRaw = defaults.protocolKind.rawValue
+        baseURL = defaults.baseURL
+        authModeRaw = defaults.authMode.rawValue
+        if model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (model == store.settings.model && model == oldDefaults.model) {
+            model = defaults.model
+        }
+        connectionTestState = .idle
     }
 
     @ViewBuilder
@@ -443,7 +584,7 @@ struct SettingsView: View {
                             .accessibilityHint(allowModelRequests ? "开启或关闭结构化规划请求" : "先开启允许模型请求后，再使用结构化规划。")
                         SettingsToggleRow(title: "答疑引用个人资料", subtitle: "回答问题时检索错题、笔记和知识点。", tint: StudyDesign.Colors.secondary, isOn: $includePersonalContextInAnswers)
                         SettingsToggleRow(title: "本地保存导入原文", subtitle: "便于后续重新分析和检索。", tint: StudyDesign.Colors.success, isOn: $keepDocumentContent)
-                        Text("关闭模型请求后，资料仍可保存在本地，但不会发送给 DeepSeek。")
+                        Text("关闭模型请求后，资料仍可保存在本地，但不会发送给当前 AI 服务。")
                             .font(.caption)
                             .foregroundStyle(StudyDesign.Colors.labelSecondary)
                             .frame(maxWidth: .infinity, alignment: .leading)

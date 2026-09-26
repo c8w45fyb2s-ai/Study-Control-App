@@ -90,9 +90,97 @@ enum AppAppearanceMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+enum AIProtocolKind: String, Codable, CaseIterable, Identifiable {
+    case openAIChatCompletions
+    case openAIResponses
+    case anthropicMessages
+    case geminiGenerateContent
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .openAIChatCompletions: return "OpenAI 兼容 Chat Completions"
+        case .openAIResponses: return "OpenAI Responses"
+        case .anthropicMessages: return "Anthropic Messages"
+        case .geminiGenerateContent: return "Gemini generateContent"
+        }
+    }
+}
+
+enum AIServicePreset: String, Codable, CaseIterable, Identifiable {
+    case deepSeek
+    case openAI
+    case anthropic
+    case gemini
+    case ollama
+    case lmStudio
+    case custom
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .deepSeek: return "DeepSeek"
+        case .openAI: return "OpenAI"
+        case .anthropic: return "Anthropic"
+        case .gemini: return "Google Gemini"
+        case .ollama: return "Ollama（本地）"
+        case .lmStudio: return "LM Studio（本地）"
+        case .custom: return "自定义服务"
+        }
+    }
+
+    var defaults: (protocolKind: AIProtocolKind, baseURL: String, model: String, authMode: AIAuthMode) {
+        switch self {
+        case .deepSeek:
+            return (.openAIChatCompletions, "https://api.deepseek.com", "", .providerKey)
+        case .openAI:
+            return (.openAIResponses, "https://api.openai.com/v1", "", .providerKey)
+        case .anthropic:
+            return (.anthropicMessages, "https://api.anthropic.com/v1", "", .providerKey)
+        case .gemini:
+            return (.geminiGenerateContent, "https://generativelanguage.googleapis.com/v1beta", "", .providerKey)
+        case .ollama:
+            return (.openAIChatCompletions, "http://localhost:11434/v1", "", .none)
+        case .lmStudio:
+            return (.openAIChatCompletions, "http://localhost:1234/v1", "", .none)
+        case .custom:
+            return (.openAIChatCompletions, "", "", .providerKey)
+        }
+    }
+}
+
+enum AIAuthMode: String, Codable, CaseIterable, Identifiable {
+    case providerKey
+    case none
+    var id: String { rawValue }
+    var label: String { self == .none ? "无需鉴权（本地或明确允许的服务）" : "使用 API Key" }
+}
+
+enum AIChatTokenParameter: String, Codable, CaseIterable, Identifiable {
+    case maxTokens
+    case maxCompletionTokens
+    case omit
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .maxTokens: return "max_tokens（兼容接口）"
+        case .maxCompletionTokens: return "max_completion_tokens（OpenAI 新接口）"
+        case .omit: return "省略输出上限"
+        }
+    }
+}
+
 struct AppSettings: Codable {
     var baseURL: String = "https://api.deepseek.com"
-    var model: String = "deepseek-v4-flash"
+    var model: String = ""
+    var servicePreset: AIServicePreset = .deepSeek
+    var protocolKind: AIProtocolKind = .openAIChatCompletions
+    var authMode: AIAuthMode = .providerKey
+    var legacyCredentialMigrationPending = false
+    var chatTokenParameter: AIChatTokenParameter = .maxTokens
+    var anthropicOutputTokenLimit: Int?
+    var temperature: Double?
+    var useNativeJSONMode = false
     var appearanceMode: AppAppearanceMode = .system
     var remindersEnabled: Bool = true
     var defaultReminderHour: Int = 9
@@ -111,6 +199,17 @@ struct AppSettings: Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         baseURL = try container.decodeIfPresent(String.self, forKey: .baseURL) ?? baseURL
         model = try container.decodeIfPresent(String.self, forKey: .model) ?? model
+        servicePreset = try container.decodeIfPresent(AIServicePreset.self, forKey: .servicePreset) ?? .deepSeek
+        protocolKind = try container.decodeIfPresent(AIProtocolKind.self, forKey: .protocolKind) ?? .openAIChatCompletions
+        authMode = try container.decodeIfPresent(AIAuthMode.self, forKey: .authMode) ?? .providerKey
+        legacyCredentialMigrationPending = try container.decodeIfPresent(Bool.self, forKey: .legacyCredentialMigrationPending)
+            ?? !container.contains(.protocolKind)
+        chatTokenParameter = try container.decodeIfPresent(AIChatTokenParameter.self, forKey: .chatTokenParameter) ?? .maxTokens
+        // Older snapshots stored an integer here. Missing means the user has
+        // not selected a service-wide cap, so each business operation uses its default.
+        anthropicOutputTokenLimit = try container.decodeIfPresent(Int.self, forKey: .anthropicOutputTokenLimit)
+        temperature = try container.decodeIfPresent(Double.self, forKey: .temperature)
+        useNativeJSONMode = try container.decodeIfPresent(Bool.self, forKey: .useNativeJSONMode) ?? useNativeJSONMode
         appearanceMode = try container.decodeIfPresent(AppAppearanceMode.self, forKey: .appearanceMode) ?? appearanceMode
         remindersEnabled = try container.decodeIfPresent(Bool.self, forKey: .remindersEnabled) ?? remindersEnabled
         defaultReminderHour = try container.decodeIfPresent(Int.self, forKey: .defaultReminderHour) ?? defaultReminderHour
@@ -1019,7 +1118,7 @@ struct ChatMemorySummary: Codable, Equatable {
     }
 }
 
-struct DeepSeekUsage: Codable {
+struct AIUsage: Codable {
     var inputTokens: Int
     var outputTokens: Int
 
@@ -1028,44 +1127,44 @@ struct DeepSeekUsage: Codable {
     }
 }
 
-struct DeepSeekAnalysisPayload: Codable {
+struct AIAnalysisPayload: Codable {
     var summary: String
-    var knowledgePoints: [DeepSeekKnowledgePoint]
-    var mistakes: [DeepSeekMistake]
-    var reviewItems: [DeepSeekReviewItem]
+    var knowledgePoints: [AIKnowledgePoint]
+    var mistakes: [AIMistake]
+    var reviewItems: [AIReviewItem]
 }
 
-struct DeepSeekKnowledgePoint: Codable {
+struct AIKnowledgePoint: Codable {
     var title: String
     var subject: String?
     var summary: String
     var mastery: Double?
 }
 
-struct DeepSeekMistake: Codable {
+struct AIMistake: Codable {
     var question: String
     var correctAnswer: String?
     var errorReason: String
     var relatedKnowledgeTitles: [String]?
 }
 
-struct DeepSeekReviewItem: Codable {
+struct AIReviewItem: Codable {
     var title: String
     var dueInDays: Int?
     var relatedKnowledgeTitle: String?
     var relatedMistakeTitle: String?
 }
 
-struct DeepSeekAIPlanPayload: Codable {
+struct AIPlanPayload: Codable {
     var isPlan: Bool?
     var title: String?
     var summary: String?
-    var knowledgePoints: [DeepSeekKnowledgePoint]?
-    var mistakes: [DeepSeekMistake]?
-    var reviewItems: [DeepSeekAIPlanReviewItem]?
+    var knowledgePoints: [AIKnowledgePoint]?
+    var mistakes: [AIMistake]?
+    var reviewItems: [AIPlanReviewItem]?
 }
 
-struct DeepSeekAIPlanReviewItem: Codable {
+struct AIPlanReviewItem: Codable {
     var title: String
     var dueInDays: Int?
     var priority: Int?
@@ -1228,7 +1327,7 @@ enum OnboardingStep: String, Codable, CaseIterable {
     var title: String {
         switch self {
         case .welcome: return "欢迎使用学习助手"
-        case .apiKey: return "配置 DeepSeek API Key"
+        case .apiKey: return "配置 AI 服务连接"
         case .importFirst: return "导入第一份学习资料"
         case .done: return "准备就绪"
         }
@@ -1239,7 +1338,7 @@ enum OnboardingStep: String, Codable, CaseIterable {
         case .welcome:
             return "学习助手帮你分析错题、规划复习，让学习更高效。\n接下来只需几步即可开始。"
         case .apiKey:
-            return "在 DeepSeek 开放平台获取 API Key 后，粘贴到下方即可。\n你的 Key 会安全存储在系统钥匙串中。"
+            return "选择服务预设和接口协议，填写模型 ID；需要鉴权的服务可粘贴 API Key。\n密钥会按服务地址和协议保存在系统钥匙串中。"
         case .importFirst:
             return "导入你的错题、笔记或课本资料，AI 会自动分析知识点和错因。"
         case .done:

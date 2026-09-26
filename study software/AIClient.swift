@@ -1,14 +1,30 @@
 import Foundation
 
-struct DeepSeekClient {
-    var apiKey: String
-    var baseURL: String
-    var model: String
-
+struct AIClient {
+    let configuration: AIConnectionConfiguration
+    let apiKey: String
+    let pricing: AIUsagePricing
+    private let adapter: any AIProviderAdapter
+    private let transport: AIHTTPTransport
     var maxRetryCount: Int = 3
     var baseRetryDelaySeconds: Double = 2
     var requestTimeoutSeconds: Double = 90
     var answerMaxTokens: Int = 4_000
+
+    init(
+        configuration: AIConnectionConfiguration,
+        apiKey: String,
+        pricing: AIUsagePricing,
+        session: URLSession = .shared,
+        underlyingTransport: (any AIHTTPTransporting)? = nil
+    ) throws {
+        try AIConnectionConfiguration.validate(configuration, apiKey: apiKey)
+        self.configuration = configuration
+        self.apiKey = apiKey
+        self.pricing = pricing
+        self.adapter = AIProviderAdapters.adapter(for: configuration.protocolKind)
+        self.transport = AIHTTPTransport(underlying: underlyingTransport ?? URLSessionAITransport(session: session))
+    }
 
     private let personalContextCharacterLimit = 30_000
     private let studyStateCharacterLimit = 12_000
@@ -48,14 +64,14 @@ struct DeepSeekClient {
     func testConnection() async throws {
         _ = try await chat(
             messages: [
-                ChatMessage(role: "system", content: "你是连接测试助手。"),
-                ChatMessage(role: "user", content: "只回复 OK。")
+                AIMessage(role: "system", content: "你是连接测试助手。"),
+                AIMessage(role: "user", content: "只回复 OK。")
             ],
-            maxTokens: 8
+            businessDefaultTokens: AIOutputBudget.connectionTest
         )
     }
 
-    func analyze(content: String, kind: DocumentKind) async throws -> DeepSeekAnalysisResult {
+    func analyze(content: String, kind: DocumentKind) async throws -> AIAnalysisResult {
         let prompt = """
         你是一个严格的学习错题分析助手。请分析下面的\(kind.rawValue)，只返回 JSON，不要 Markdown。
         JSON 结构必须是：
@@ -67,10 +83,11 @@ struct DeepSeekClient {
         """
         let decoded = try await requestJSON(
             prompt: prompt,
-            responseType: DeepSeekAnalysisPayload.self,
-            repairSchema: Self.analysisJSONSchema
+            responseType: AIAnalysisPayload.self,
+            repairSchema: Self.analysisJSONSchema,
+            businessDefaultTokens: AIOutputBudget.documentAnalysis
         )
-        return DeepSeekAnalysisResult(payload: decoded.value, usage: decoded.usage)
+        return AIAnalysisResult(payload: decoded.value, usage: decoded.usage)
     }
 
     func answer(
@@ -80,7 +97,7 @@ struct DeepSeekClient {
         chatHistory: [ChatHistoryMessage],
         compressedContextSummary: String,
         answerMode: AIAnswerMode
-    ) async throws -> DeepSeekAnswerResult {
+    ) async throws -> AIAnswerResult {
         let personalContext = context.isEmpty ? "没有从用户个人资料中检索到直接相关内容。" : String(context.prefix(personalContextCharacterLimit))
         let studyStateContext = studyState.isEmpty ? "暂未形成学习状态摘要。" : String(studyState.prefix(studyStateCharacterLimit))
         let longTermContext = compressedContextSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -88,8 +105,8 @@ struct DeepSeekClient {
             : String(compressedContextSummary.prefix(chatSummaryCharacterLimit))
         let historyMessages = makeHistoryMessages(from: chatHistory)
 
-        var messages: [ChatMessage] = [
-            ChatMessage(role: "system", content: """
+        var messages: [AIMessage] = [
+            AIMessage(role: "system", content: """
             你是用户的私人学习搭子，也是这个学习软件里的 AI 工作台。你要自然、简洁、耐心，像真人老师一样承接上下文。
 
             工作方式：
@@ -105,7 +122,7 @@ struct DeepSeekClient {
             - 普通答疑：回答更短，优先解决当前问题；不要展开过长规划。
             - 深度规划：可以更系统地分阶段、排任务、引用个人资料。
             """),
-            ChatMessage(role: "user", content: """
+            AIMessage(role: "user", content: """
             长期记忆：
             \(longTermContext)
 
@@ -118,10 +135,13 @@ struct DeepSeekClient {
         ]
 
         messages.append(contentsOf: historyMessages)
-        messages.append(ChatMessage(role: "user", content: String(question.prefix(8_000))))
+        messages.append(AIMessage(role: "user", content: String(question.prefix(8_000))))
 
-        let result = try await chat(messages: messages, maxTokens: min(answerMaxTokens, answerMode.maxAnswerTokens))
-        return DeepSeekAnswerResult(answer: result.content, usage: result.usage)
+        let result = try await chat(
+            messages: messages,
+            businessDefaultTokens: min(answerMaxTokens, answerMode.maxAnswerTokens)
+        )
+        return AIAnswerResult(answer: result.text, usage: result.usage)
     }
 
     func makeAIPlanDraft(
@@ -130,7 +150,7 @@ struct DeepSeekClient {
         context: String,
         studyState: String,
         planTemplate: AIPlanTemplate
-    ) async throws -> DeepSeekAIPlanResult {
+    ) async throws -> AIPlanResult {
         let prompt = """
         你是学习软件的 AI 规划结构化助手。请判断这轮对话是否已经给出了可落地的学习规划、复习方案、每日任务或备考安排。
 
@@ -173,19 +193,20 @@ struct DeepSeekClient {
 
         let decoded = try await requestJSON(
             prompt: prompt,
-            responseType: DeepSeekAIPlanPayload.self,
-            repairSchema: Self.aiPlanJSONSchema
+            responseType: AIPlanPayload.self,
+            repairSchema: Self.aiPlanJSONSchema,
+            businessDefaultTokens: AIOutputBudget.planDraft
         )
-        return DeepSeekAIPlanResult(payload: decoded.value, usage: decoded.usage)
+        return AIPlanResult(payload: decoded.value, usage: decoded.usage)
     }
 
     func compressChatContext(
         existingMemory: ChatMemorySummary,
         messages: [ChatHistoryMessage],
         studyState: String
-    ) async throws -> DeepSeekSummaryResult {
+    ) async throws -> AISummaryResult {
         guard !messages.isEmpty else {
-            return DeepSeekSummaryResult(summary: existingMemory.promptText, memory: existingMemory, usage: nil)
+            return AISummaryResult(summary: existingMemory.promptText, memory: existingMemory, usage: nil)
         }
 
         let memoryText = existingMemory.promptText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -224,28 +245,29 @@ struct DeepSeekClient {
         let decoded = try await requestJSON(
             prompt: prompt,
             responseType: ChatMemorySummary.self,
-            repairSchema: Self.chatMemoryJSONSchema
+            repairSchema: Self.chatMemoryJSONSchema,
+            businessDefaultTokens: AIOutputBudget.memoryCompression
         )
 
         let memory = decoded.value
-        return DeepSeekSummaryResult(
+        return AISummaryResult(
             summary: String(memory.promptText.prefix(chatSummaryCharacterLimit)),
             memory: memory,
             usage: decoded.usage
         )
     }
 
-    private func makeHistoryMessages(from chatHistory: [ChatHistoryMessage]) -> [ChatMessage] {
+    private func makeHistoryMessages(from chatHistory: [ChatHistoryMessage]) -> [AIMessage] {
         let recentMessages = chatHistory.suffix(chatHistoryMessageLimit)
         var remainingCharacters = chatHistoryCharacterLimit
-        var boundedMessages: [ChatMessage] = []
+        var boundedMessages: [AIMessage] = []
 
         for message in recentMessages.reversed() {
             guard remainingCharacters > 0 else { break }
             let content = String(message.content.prefix(remainingCharacters))
             remainingCharacters -= content.count
             boundedMessages.insert(
-                ChatMessage(role: message.role == .user ? "user" : "assistant", content: content),
+                AIMessage(role: message.role == .user ? "user" : "assistant", content: content),
                 at: 0
             )
         }
@@ -256,144 +278,80 @@ struct DeepSeekClient {
     private func requestJSON<T: Decodable>(
         prompt: String,
         responseType: T.Type,
-        repairSchema: String = DeepSeekClient.analysisJSONSchema
-    ) async throws -> DeepSeekDecodedResult<T> {
+        repairSchema: String = AIClient.analysisJSONSchema,
+        businessDefaultTokens: Int = AIOutputBudget.documentAnalysis
+    ) async throws -> AIDecodedResult<T> {
         let result = try await chat(messages: [
-            ChatMessage(role: "system", content: "你只返回可以直接 JSONDecoder 解码的 JSON。"),
-            ChatMessage(role: "user", content: prompt)
-        ])
+            AIMessage(role: "system", content: "你只返回可以直接 JSONDecoder 解码的 JSON。"),
+            AIMessage(role: "user", content: prompt)
+        ], businessDefaultTokens: businessDefaultTokens, structuredOutputRequested: true)
         do {
-            return DeepSeekDecodedResult(value: try decodeJSON(result.content, responseType: responseType), usage: result.usage)
+            return AIDecodedResult(value: try decodeJSON(result.text, responseType: responseType), usage: result.usage)
         } catch {
-            let repaired = try await chat(messages: [
-                ChatMessage(role: "system", content: "你是 JSON 修复器。只返回一个可以被 JSONDecoder 解码的 JSON 对象，不要 Markdown，不要解释。"),
-                ChatMessage(role: "user", content: """
-                请把下面内容修复成符合要求的 JSON。必须保留原意，缺失字段请用合理默认值补齐。
+            let repaired: AICompletion
+            do {
+                repaired = try await chat(messages: [
+                    AIMessage(role: "system", content: "你是 JSON 修复器。只返回一个可以被 JSONDecoder 解码的 JSON 对象，不要 Markdown，不要解释。"),
+                    AIMessage(role: "user", content: """
+                    请把下面内容修复成符合要求的 JSON。必须保留原意，缺失字段请用合理默认值补齐。
 
-                JSON 结构：
-                \(repairSchema)
+                    JSON 结构：
+                    \(repairSchema)
 
-                原始内容：
-                \(result.content)
-                """)
-            ])
+                    原始内容：
+                    \(result.text)
+                    """)
+                ], businessDefaultTokens: businessDefaultTokens, structuredOutputRequested: true)
+            } catch let refusal as AIModelRefusal {
+                throw AIModelRefusal(
+                    message: refusal.message,
+                    usage: combineUsage(result.usage, refusal.usage),
+                    pricing: refusal.pricing
+                )
+            }
 
             do {
-                return DeepSeekDecodedResult(
-                    value: try decodeJSON(repaired.content, responseType: responseType),
+                return AIDecodedResult(
+                    value: try decodeJSON(repaired.text, responseType: responseType),
                     usage: combineUsage(result.usage, repaired.usage)
                 )
             } catch {
-                throw DeepSeekError.invalidJSON(error.localizedDescription)
+                throw AIError.invalidJSON(error.localizedDescription)
             }
         }
     }
 
-    private func chat(messages: [ChatMessage], maxTokens: Int? = nil) async throws -> DeepSeekChatResult {
-        guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw DeepSeekError.missingAPIKey
-        }
-
-        let endpoint = URL(string: baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/chat/completions")!
-        let httpBody = try JSONEncoder().encode(ChatRequest(model: model, messages: messages, temperature: 0.2, maxTokens: maxTokens))
-
-        var lastError: Error?
-        for attempt in 0...max(maxRetryCount, 0) {
-            do {
-                var request = URLRequest(url: endpoint)
-                request.httpMethod = "POST"
-                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.timeoutInterval = requestTimeoutSeconds
-                request.httpBody = httpBody
-
-                let (data, response) = try await URLSession.shared.data(for: request)
-
-                guard let http = response as? HTTPURLResponse else {
-                    throw DeepSeekError.requestFailed("无法识别服务器响应。")
-                }
-
-                if (500...599).contains(http.statusCode) || http.statusCode == 429 {
-                    let bodySnippet = String(data: data, encoding: .utf8)?.prefix(300) ?? ""
-                    let retryAfterString = (http.allHeaderFields["Retry-After"] as? String)
-                        ?? (http.allHeaderFields["retry-after"] as? String)
-                    let serverDelay = Double(retryAfterString ?? "") ?? baseRetryDelaySeconds * pow(2, Double(attempt))
-                    let delay = min(serverDelay, 30)
-
-                    if attempt < maxRetryCount {
-                        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                        lastError = DeepSeekError.retryableError(
-                            status: http.statusCode,
-                            attempt: attempt + 1,
-                            detail: String(bodySnippet)
-                        )
-                        continue
-                    }
-                    throw DeepSeekError.requestFailed(
-                        "服务器 \(http.statusCode)（已重试 \(maxRetryCount) 次）：\(bodySnippet)"
-                    )
-                }
-
-                guard 200..<300 ~= http.statusCode else {
-                    let body = String(data: data, encoding: .utf8) ?? "无响应正文"
-                    if http.statusCode == 401 || http.statusCode == 403 {
-                        throw DeepSeekError.authenticationFailed
-                    }
-                    if http.statusCode == 404 {
-                        if body.localizedCaseInsensitiveContains("model") {
-                            throw DeepSeekError.modelUnavailable(model)
-                        }
-                        throw DeepSeekError.endpointNotFound
-                    }
-                    if http.statusCode == 400 && body.localizedCaseInsensitiveContains("model") {
-                        throw DeepSeekError.modelUnavailable(model)
-                    }
-                    throw DeepSeekError.requestFailed(body)
-                }
-
-                let decoded = try JSONDecoder().decode(ChatResponse.self, from: data)
-                guard let content = decoded.choices.first?.message.content else {
-                    throw DeepSeekError.emptyResponse
-                }
-                return DeepSeekChatResult(content: content, usage: decoded.usage?.deepSeekUsage)
-
-            } catch let error as DeepSeekError {
-                if case .retryableError = error {
-                    continue
-                }
-                if attempt < maxRetryCount, isNetworkRecoverable(error) {
-                    let delay = baseRetryDelaySeconds * pow(2, Double(attempt))
-                    try? await Task.sleep(nanoseconds: UInt64(min(delay, 15) * 1_000_000_000))
-                    lastError = error
-                    continue
-                }
-                throw error
-            } catch {
-                if attempt < maxRetryCount, isNetworkRecoverable(error) {
-                    let delay = baseRetryDelaySeconds * pow(2, Double(attempt))
-                    try? await Task.sleep(nanoseconds: UInt64(min(delay, 15) * 1_000_000_000))
-                    lastError = error
-                    continue
-                }
-                throw error
-            }
-        }
-
-        throw DeepSeekError.requestFailed(
-            "重试 \(maxRetryCount) 次后仍然失败：\(lastError?.localizedDescription ?? "未知错误")"
+    private func chat(
+        messages: [AIMessage],
+        businessDefaultTokens: Int? = nil,
+        structuredOutputRequested: Bool = false
+    ) async throws -> AICompletion {
+        let request = try adapter.makeRequest(
+            configuration: configuration,
+            apiKey: apiKey,
+            messages: messages,
+            options: AIRequestOptions(maxOutputTokens: businessDefaultTokens, structuredOutputRequested: structuredOutputRequested),
+            timeout: requestTimeoutSeconds
         )
-    }
-
-    private func isNetworkRecoverable(_ error: Error) -> Bool {
-        let nsError = error as NSError
-        return nsError.domain == NSURLErrorDomain && [
-            NSURLErrorTimedOut,
-            NSURLErrorCannotFindHost,
-            NSURLErrorCannotConnectToHost,
-            NSURLErrorNetworkConnectionLost,
-            NSURLErrorDNSLookupFailed,
-            NSURLErrorNotConnectedToInternet
-        ].contains(nsError.code)
+        var transport = self.transport
+        transport.baseRetryDelaySeconds = baseRetryDelaySeconds
+        let (data, _) = try await transport.data(for: request, maxRetryCount: maxRetryCount)
+        let completion: AICompletion
+        do {
+            completion = try adapter.parseResponse(data)
+        } catch AIError.truncatedResponse {
+            if configuration.protocolKind == .anthropicMessages {
+                throw AIError.outputBudgetReached(
+                    limit: AIOutputBudget.anthropicLimit(configuration: configuration, businessDefault: businessDefaultTokens),
+                    settingName: "设置 > 模型连接 > Anthropic 最大输出预算"
+                )
+            }
+            throw AIError.truncatedResponse
+        }
+        if let refusal = completion.refusal?.trimmingCharacters(in: .whitespacesAndNewlines), !refusal.isEmpty {
+            throw AIModelRefusal(message: refusal, usage: completion.usage, pricing: pricing)
+        }
+        return completion
     }
 
     private func decodeJSON<T: Decodable>(_ text: String, responseType: T.Type) throws -> T {
@@ -414,7 +372,7 @@ struct DeepSeekClient {
         }
 
         guard let start = cleaned.firstIndex(of: "{") else {
-            throw DeepSeekError.invalidJSON("没有找到 JSON 对象开头。")
+            throw AIError.invalidJSON("没有找到 JSON 对象开头。")
         }
 
         var depth = 0
@@ -451,121 +409,64 @@ struct DeepSeekClient {
             }
         }
 
-        throw DeepSeekError.invalidJSON("JSON 对象没有完整闭合。")
+        throw AIError.invalidJSON("JSON 对象没有完整闭合。")
     }
 
-    private func combineUsage(_ first: DeepSeekUsage?, _ second: DeepSeekUsage?) -> DeepSeekUsage? {
+    private func combineUsage(_ first: AIUsage?, _ second: AIUsage?) -> AIUsage? {
         guard first != nil || second != nil else { return nil }
-        return DeepSeekUsage(
+        return AIUsage(
             inputTokens: (first?.inputTokens ?? 0) + (second?.inputTokens ?? 0),
             outputTokens: (first?.outputTokens ?? 0) + (second?.outputTokens ?? 0)
         )
     }
 }
 
-struct DeepSeekAnalysisResult {
-    var payload: DeepSeekAnalysisPayload
-    var usage: DeepSeekUsage?
+struct AIAnalysisResult {
+    var payload: AIAnalysisPayload
+    var usage: AIUsage?
 }
 
-struct DeepSeekAnswerResult {
+struct AIAnswerResult {
     var answer: String
-    var usage: DeepSeekUsage?
+    var usage: AIUsage?
 }
 
-struct DeepSeekSummaryResult {
+struct AISummaryResult {
     var summary: String
     var memory: ChatMemorySummary
-    var usage: DeepSeekUsage?
+    var usage: AIUsage?
 }
 
-struct DeepSeekAIPlanResult {
-    var payload: DeepSeekAIPlanPayload
-    var usage: DeepSeekUsage?
+struct AIPlanResult {
+    var payload: AIPlanPayload
+    var usage: AIUsage?
 }
 
-private struct DeepSeekDecodedResult<T> {
+private struct AIDecodedResult<T> {
     var value: T
-    var usage: DeepSeekUsage?
+    var usage: AIUsage?
 }
 
-private struct DeepSeekChatResult {
-    var content: String
-    var usage: DeepSeekUsage?
+struct AIUsagePricing {
+    var inputPerMillion: Double
+    var outputPerMillion: Double
 }
 
-enum DeepSeekError: LocalizedError {
-    case missingAPIKey
-    case authenticationFailed
-    case endpointNotFound
-    case modelUnavailable(String)
-    case requestFailed(String)
-    case emptyResponse
-    case invalidJSON(String)
-    case retryableError(status: Int, attempt: Int, detail: String)
+struct AIModelRefusal: LocalizedError {
+    var message: String
+    var usage: AIUsage?
+    var pricing: AIUsagePricing
 
-    var errorDescription: String? {
-        switch self {
-        case .missingAPIKey:
-            return "请先在设置中填写 DeepSeek API Key。"
-        case .authenticationFailed:
-            return "鉴权失败，请检查 API Key 是否有效。"
-        case .endpointNotFound:
-            return "找不到模型端点，请检查 Base URL。"
-        case .modelUnavailable(let model):
-            return "模型“\(model)”不可用，请检查模型名称或账户权限。"
-        case .requestFailed(let body):
-            return "DeepSeek 请求失败：\(body)"
-        case .emptyResponse:
-            return "DeepSeek 没有返回可用内容。"
-        case .invalidJSON(let reason):
-            return "DeepSeek 返回的结构化结果无法解析：\(reason)"
-        case .retryableError(let status, let attempt, _):
-            return "服务器返回 \(status)，正在第 \(attempt) 次重试..."
-        }
-    }
+    var errorDescription: String? { "当前 AI 服务拒绝了请求：\(message)" }
 }
 
-private struct ChatRequest: Encodable {
-    var model: String
-    var messages: [ChatMessage]
-    var temperature: Double
-    var maxTokens: Int?
-
-    enum CodingKeys: String, CodingKey {
-        case model
-        case messages
-        case temperature
-        case maxTokens = "max_tokens"
-    }
-}
-
-private struct ChatMessage: Codable {
-    var role: String
-    var content: String
-}
-
-private struct ChatResponse: Decodable {
-    var choices: [Choice]
-    var usage: ResponseUsage?
-
-    struct Choice: Decodable {
-        var message: ChatMessage
-    }
-
-    struct ResponseUsage: Decodable {
-        var promptTokens: Int?
-        var completionTokens: Int?
-        var totalTokens: Int?
-
-        enum CodingKeys: String, CodingKey {
-            case promptTokens = "prompt_tokens"
-            case completionTokens = "completion_tokens"
-            case totalTokens = "total_tokens"
-        }
-
-        var deepSeekUsage: DeepSeekUsage {
-            DeepSeekUsage(inputTokens: promptTokens ?? 0, outputTokens: completionTokens ?? 0)
-        }
+enum AIClientFactory {
+    static func make(settings: AppSettings, apiKey: String, session: URLSession = .shared, underlyingTransport: (any AIHTTPTransporting)? = nil) throws -> AIClient {
+        let configuration = AIConnectionConfiguration(settings: settings)
+        let pricing = AIUsagePricing(
+            inputPerMillion: settings.inputTokenCostPerMillion,
+            outputPerMillion: settings.outputTokenCostPerMillion
+        )
+        return try AIClient(configuration: configuration, apiKey: apiKey, pricing: pricing, session: session, underlyingTransport: underlyingTransport)
     }
 }

@@ -15,6 +15,8 @@
 
 ```sh
 make verify-ai-plan
+make verify-ai-protocols
+make verify-dashboard
 xcodebuild -project "study software.xcodeproj" -scheme "study software" -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO build
 xcodebuild -project "study software.xcodeproj" -scheme "study software" -configuration Debug -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
 ```
