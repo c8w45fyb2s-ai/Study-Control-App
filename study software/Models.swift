@@ -7,16 +7,20 @@ import Foundation
 /// - 4 → 5：引入统一数据层（课表、可用时间偏好、每日计划、学习会话、完成事件、奖励）。
 /// - 5 → 6：增加可持久化的用户手动学习任务。
 /// - 6 → 7：手动任务改用可选到期日，旧安排日迁为到期日。
-/// - 迁移步骤见 `SnapshotMigration.swift`；迁移不是"把数字改成 7"。
+/// - 7 → 8：卡片与逐次作答；8 → 9：逐页资料及引用；9 → 10：计划耗时校准说明。
+/// - 迁移步骤见 `SnapshotMigration.swift`；旧记录缺失的事实不作推算。
 enum StudySchema {
     /// 当前写入磁盘的版本。
-    static let currentVersion = 7
+    static let currentVersion = 10
     /// 引入统一计划层的版本。
     static let planningLayerVersion = 5
     /// 持久化手动学习任务的版本。
     static let manualStudyTasksVersion = 6
     /// 手动任务可选到期日的版本。
     static let manualTaskDueDateVersion = 7
+    static let activeRecallVersion = 8
+    static let documentEvidenceVersion = 9
+    static let durationCalibrationVersion = 10
     /// 统一计划层之前最后一个版本（旧备份的基线）。
     static let legacyBaselineVersion = 4
     /// 仍然允许读取并迁移的最低版本。
@@ -188,6 +192,7 @@ struct AppSettings: Codable {
     var allowStructuredPlanRequests: Bool = true
     var includePersonalContextInAnswers: Bool = true
     var keepDocumentContent: Bool = true
+    var keepOriginalPDF: Bool = false
     var answerMode: AIAnswerMode = .normal
     var maxAnalysisChunkCharacters: Int = 12_000
     var inputTokenCostPerMillion: Double = 0
@@ -217,6 +222,7 @@ struct AppSettings: Codable {
         allowStructuredPlanRequests = try container.decodeIfPresent(Bool.self, forKey: .allowStructuredPlanRequests) ?? allowStructuredPlanRequests
         includePersonalContextInAnswers = try container.decodeIfPresent(Bool.self, forKey: .includePersonalContextInAnswers) ?? includePersonalContextInAnswers
         keepDocumentContent = try container.decodeIfPresent(Bool.self, forKey: .keepDocumentContent) ?? keepDocumentContent
+        keepOriginalPDF = try container.decodeIfPresent(Bool.self, forKey: .keepOriginalPDF) ?? false
         answerMode = try container.decodeIfPresent(AIAnswerMode.self, forKey: .answerMode) ?? answerMode
         maxAnalysisChunkCharacters = try container.decodeIfPresent(Int.self, forKey: .maxAnalysisChunkCharacters) ?? maxAnalysisChunkCharacters
         inputTokenCostPerMillion = try container.decodeIfPresent(Double.self, forKey: .inputTokenCostPerMillion) ?? inputTokenCostPerMillion
@@ -256,6 +262,40 @@ struct AppDiagnosticEvent: Identifiable, Codable {
     var message: String
 }
 
+enum DocumentExtractionMethod: String, Codable { case nativeText, ocr, none }
+enum DocumentProcessingState: String, Codable { case succeeded, failed, empty }
+
+struct DocumentPage: Codable, Identifiable {
+    var documentID: UUID
+    /// PDF 页序，始终从 1 开始；不推测印刷页码。
+    var pageNumber: Int
+    var text: String
+    var method: DocumentExtractionMethod
+    var state: DocumentProcessingState
+    var failureReason: String?
+    var id: String { "\(documentID.uuidString)-page-\(pageNumber)" }
+}
+
+struct DocumentChunk: Codable, Identifiable {
+    var id: String
+    var documentID: UUID
+    var startPage: Int?
+    var endPage: Int?
+    var chapterTitle: String?
+    var text: String
+    var startOffset: Int
+    var endOffset: Int
+}
+
+struct SourceReference: Codable, Hashable {
+    var documentID: UUID
+    var chunkID: String?
+    var pageNumber: Int?
+    var excerpt: String
+
+    var pageLabel: String { pageNumber.map { "第 \($0) 页" } ?? "旧资料暂无页码" }
+}
+
 struct StudyDocument: Identifiable, Codable {
     var id = UUID()
     var title: String
@@ -263,6 +303,12 @@ struct StudyDocument: Identifiable, Codable {
     var kind: DocumentKind
     var importedAt = Date()
     var content: String
+    var pages: [DocumentPage] = []
+    var chunks: [DocumentChunk] = []
+    /// 仅存应用管理目录中的文件名；备份不依赖设备绝对路径。
+    var originalPDFFileName: String?
+    /// 只在显式 JSON 备份中填充；常规快照不保存附件副本。
+    var backupPDFData: Data?
 
     init(
         id: UUID = UUID(),
@@ -289,6 +335,10 @@ struct StudyDocument: Identifiable, Codable {
         kind = try container.decodeIfPresent(DocumentKind.self, forKey: .kind) ?? .note
         importedAt = try container.decodeIfPresent(Date.self, forKey: .importedAt) ?? Date()
         content = try container.decodeIfPresent(String.self, forKey: .content) ?? ""
+        pages = try container.decodeIfPresent([DocumentPage].self, forKey: .pages) ?? []
+        chunks = try container.decodeIfPresent([DocumentChunk].self, forKey: .chunks) ?? []
+        originalPDFFileName = try container.decodeIfPresent(String.self, forKey: .originalPDFFileName)
+        backupPDFData = try container.decodeIfPresent(Data.self, forKey: .backupPDFData)
     }
 }
 
@@ -390,6 +440,8 @@ struct KnowledgePoint: Identifiable, Codable {
     var summary: String
     var mastery: Double
     var createdAt = Date()
+    var sourceDocumentID: UUID?
+    var sourceReference: SourceReference?
 
     init(
         id: UUID = UUID(),
@@ -415,6 +467,8 @@ struct KnowledgePoint: Identifiable, Codable {
         summary = try container.decodeIfPresent(String.self, forKey: .summary) ?? ""
         mastery = try container.decodeIfPresent(Double.self, forKey: .mastery) ?? 0
         createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        sourceDocumentID = try container.decodeIfPresent(UUID.self, forKey: .sourceDocumentID)
+        sourceReference = try container.decodeIfPresent(SourceReference.self, forKey: .sourceReference)
     }
 }
 
@@ -424,8 +478,12 @@ struct Mistake: Identifiable, Codable {
     var correctAnswer: String
     var errorReason: String
     var sourceDocumentID: UUID?
+    var sourceReference: SourceReference?
     var knowledgePointIDs: [UUID]
     var createdAt = Date()
+    var practiceState: MistakePracticeState = .needsCorrection
+    var stateChangedAt: Date?
+    var stateChangeSource: String?
 
     init(
         id: UUID = UUID(),
@@ -452,9 +510,78 @@ struct Mistake: Identifiable, Codable {
         correctAnswer = try container.decodeIfPresent(String.self, forKey: .correctAnswer) ?? ""
         errorReason = try container.decodeIfPresent(String.self, forKey: .errorReason) ?? ""
         sourceDocumentID = try container.decodeIfPresent(UUID.self, forKey: .sourceDocumentID)
+        sourceReference = try container.decodeIfPresent(SourceReference.self, forKey: .sourceReference)
         knowledgePointIDs = try container.decodeIfPresent([UUID].self, forKey: .knowledgePointIDs) ?? []
         createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        practiceState = try container.decodeIfPresent(MistakePracticeState.self, forKey: .practiceState) ?? .needsCorrection
+        stateChangedAt = try container.decodeIfPresent(Date.self, forKey: .stateChangedAt)
+        stateChangeSource = try container.decodeIfPresent(String.self, forKey: .stateChangeSource)
     }
+}
+
+enum MistakePracticeState: String, Codable, CaseIterable {
+    case needsCorrection, needsRetry, reviewing, mastered
+
+    var label: String {
+        switch self {
+        case .needsCorrection: return "待订正"
+        case .needsRetry: return "待重做"
+        case .reviewing: return "复习中"
+        case .mastered: return "已掌握归档"
+        }
+    }
+}
+
+/// 题面与答案独立于复习任务和每次作答。编辑只增加版本，不改写旧作答。
+struct StudyCard: Identifiable, Codable {
+    enum Kind: String, Codable, CaseIterable {
+        case questionAnswer, cloze
+        var label: String { self == .cloze ? "挖空" : "问答" }
+    }
+
+    var id: UUID = UUID()
+    var kind: Kind
+    var prompt: String
+    var answer: String
+    var knowledgePointID: UUID?
+    var mistakeID: UUID?
+    var sourceDocumentID: UUID?
+    var sourceExcerpt: String?
+    var sourceReference: SourceReference?
+    var contentVersion: Int = 1
+    var createdAt: Date = Date()
+
+    init(kind: Kind, prompt: String, answer: String, knowledgePointID: UUID? = nil,
+         mistakeID: UUID? = nil, sourceDocumentID: UUID? = nil, sourceExcerpt: String? = nil) {
+        self.kind = kind
+        self.prompt = prompt
+        self.answer = answer
+        self.knowledgePointID = knowledgePointID
+        self.mistakeID = mistakeID
+        self.sourceDocumentID = sourceDocumentID
+        self.sourceExcerpt = sourceExcerpt
+    }
+}
+
+/// 同一道题可在同一天有多次独立作答；ID 是一次提交的幂等键。
+struct ReviewAttempt: Identifiable, Codable {
+    var id: UUID
+    var cardID: UUID
+    var contentVersion: Int
+    var reviewTaskID: UUID?
+    var startedAt: Date
+    var submittedAt: Date
+    var answer: String?
+    var quality: Int
+    var revealedAnswer: Bool
+    var durationSeconds: Int?
+    var revokedAt: Date?
+    var revocationReason: String?
+    var completionEventID: UUID?
+    /// 撤销最新作答时恢复当次提交前的调度；旧快照不推算此字段。
+    var priorReviewTask: ReviewTask?
+
+    var isActive: Bool { revokedAt == nil }
 }
 
 struct ReviewTask: Identifiable, Codable {
@@ -463,6 +590,7 @@ struct ReviewTask: Identifiable, Codable {
     var dueDate: Date
     var knowledgePointID: UUID?
     var mistakeID: UUID?
+    var cardID: UUID?
     var status: ReviewStatus = .pending
     var remindersEnabled: Bool = true
     var priority: Int?
@@ -537,6 +665,7 @@ struct ReviewTask: Identifiable, Codable {
         intervalDays = try container.decodeIfPresent(Int.self, forKey: .intervalDays) ?? 0
         lastQuality = try container.decodeIfPresent(Int.self, forKey: .lastQuality)
         lastReviewedAt = try container.decodeIfPresent(Date.self, forKey: .lastReviewedAt)
+        cardID = try container.decodeIfPresent(UUID.self, forKey: .cardID)
     }
 }
 
@@ -911,6 +1040,8 @@ struct StoreSnapshot: Codable {
     var knowledgePoints: [KnowledgePoint] = []
     var mistakes: [Mistake] = []
     var reviewTasks: [ReviewTask] = []
+    var studyCards: [StudyCard] = []
+    var reviewAttempts: [ReviewAttempt] = []
     var drafts: [AnalysisDraft] = []
     var aiPlanDrafts: [AIPlanDraft] = []
     var aiPlanPatches: [AIPlanPatch] = []
@@ -968,6 +1099,8 @@ struct StoreSnapshot: Codable {
         knowledgePoints = try container.decodeIfPresent([KnowledgePoint].self, forKey: .knowledgePoints) ?? []
         mistakes = try container.decodeIfPresent([Mistake].self, forKey: .mistakes) ?? []
         reviewTasks = try container.decodeIfPresent([ReviewTask].self, forKey: .reviewTasks) ?? []
+        studyCards = try container.decodeIfPresent([StudyCard].self, forKey: .studyCards) ?? []
+        reviewAttempts = try container.decodeIfPresent([ReviewAttempt].self, forKey: .reviewAttempts) ?? []
         drafts = try container.decodeIfPresent([AnalysisDraft].self, forKey: .drafts) ?? []
         aiPlanDrafts = try container.decodeIfPresent([AIPlanDraft].self, forKey: .aiPlanDrafts) ?? []
         aiPlanPatches = try container.decodeIfPresent([AIPlanPatch].self, forKey: .aiPlanPatches) ?? []
@@ -1189,6 +1322,7 @@ struct ChatMessageCitation: Identifiable, Codable {
     var excerpt: String
     var sourceID: UUID?
     var promptIndex: Int
+    var sourceReference: SourceReference?
 
     init(
         id: UUID = UUID(),
@@ -1196,7 +1330,8 @@ struct ChatMessageCitation: Identifiable, Codable {
         title: String,
         excerpt: String,
         sourceID: UUID? = nil,
-        promptIndex: Int
+        promptIndex: Int,
+        sourceReference: SourceReference? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -1204,6 +1339,7 @@ struct ChatMessageCitation: Identifiable, Codable {
         self.excerpt = excerpt
         self.sourceID = sourceID
         self.promptIndex = promptIndex
+        self.sourceReference = sourceReference
     }
 
     init(from decoder: Decoder) throws {
@@ -1214,6 +1350,7 @@ struct ChatMessageCitation: Identifiable, Codable {
         excerpt = try container.decodeIfPresent(String.self, forKey: .excerpt) ?? ""
         sourceID = try container.decodeIfPresent(UUID.self, forKey: .sourceID)
         promptIndex = try container.decodeIfPresent(Int.self, forKey: .promptIndex) ?? 0
+        sourceReference = try container.decodeIfPresent(SourceReference.self, forKey: .sourceReference)
     }
 }
 

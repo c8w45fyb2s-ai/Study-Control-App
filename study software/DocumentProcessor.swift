@@ -21,8 +21,8 @@ enum DocumentProcessor {
         let type = UTType(filenameExtension: url.pathExtension.lowercased())
         let fileExtension = url.pathExtension.lowercased()
 
-        if type?.conforms(to: .pdf) == true {
-            return try readPDF(url)
+        if fileExtension == "pdf" || type?.conforms(to: .pdf) == true {
+            return try await readStructuredContent(from: url, documentID: UUID()).content
         }
 
         if type?.conforms(to: .image) == true {
@@ -58,19 +58,77 @@ enum DocumentProcessor {
         throw ProcessingError.unsupportedFile
     }
 
-    private static func readPDF(_ url: URL) throws -> String {
-        guard let document = PDFDocument(url: url) else { throw ProcessingError.unsupportedFile }
-        var pages: [String] = []
-        for index in 0..<document.pageCount {
-            if let page = document.page(at: index), let text = page.string {
-                pages.append(text)
-            }
+    struct StructuredContent {
+        var content: String
+        var pages: [DocumentPage]
+    }
+
+    static func readStructuredContent(
+        from url: URL,
+        documentID: UUID,
+        progress: @MainActor @escaping (Int, Int) -> Void = { _, _ in }
+    ) async throws -> StructuredContent {
+        let type = UTType(filenameExtension: url.pathExtension.lowercased())
+        guard url.pathExtension.lowercased() == "pdf" || type?.conforms(to: .pdf) == true else {
+            return StructuredContent(content: try await readContent(from: url), pages: [])
         }
-        let result = pages.joined(separator: "\n\n")
+        guard let document = PDFDocument(url: url) else { throw ProcessingError.unsupportedFile }
+        var pages: [DocumentPage] = []
+        await progress(0, document.pageCount)
+        for index in 0..<document.pageCount {
+            try Task.checkCancellation()
+            let pageNumber = index + 1
+            guard let page = document.page(at: index) else {
+                pages.append(DocumentPage(documentID: documentID, pageNumber: pageNumber, text: "",
+                    method: .none, state: .failed, failureReason: "无法读取 PDF 页面"))
+                await progress(pageNumber, document.pageCount)
+                continue
+            }
+            let nativeText = page.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if nativeText.count >= 12 {
+                pages.append(DocumentPage(documentID: documentID, pageNumber: pageNumber,
+                    text: nativeText, method: .nativeText, state: .succeeded, failureReason: nil))
+            } else {
+                do {
+                    let scannedText = try await recognizePDFPage(page)
+                    pages.append(DocumentPage(documentID: documentID, pageNumber: pageNumber,
+                        text: scannedText, method: .ocr, state: .succeeded, failureReason: nil))
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    let fallback = nativeText
+                    pages.append(DocumentPage(documentID: documentID, pageNumber: pageNumber,
+                        text: fallback, method: fallback.isEmpty ? .ocr : .nativeText,
+                        state: fallback.isEmpty ? .failed : .succeeded,
+                        failureReason: fallback.isEmpty ? error.localizedDescription : nil))
+                }
+            }
+            await progress(pageNumber, document.pageCount)
+        }
+        try Task.checkCancellation()
+        let result = pages.filter { $0.state == .succeeded }.map(\.text).joined(separator: "\n\n")
         guard !result.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ProcessingError.emptyPDF
         }
-        return result
+        return StructuredContent(content: result, pages: pages)
+    }
+
+    private static func recognizePDFPage(_ page: PDFPage) async throws -> String {
+        try Task.checkCancellation()
+        let bounds = page.bounds(for: .mediaBox)
+        let longest = max(bounds.width, bounds.height)
+        guard longest > 0 else { throw ProcessingError.emptyOCR }
+        let scale = min(2.0, 1_600 / longest)
+        let thumbnail = page.thumbnail(of: CGSize(width: max(1, bounds.width * scale),
+                                                  height: max(1, bounds.height * scale)), for: .mediaBox)
+#if os(macOS)
+        guard let cgImage = thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            throw ProcessingError.emptyOCR
+        }
+#else
+        guard let cgImage = thumbnail.cgImage else { throw ProcessingError.emptyOCR }
+#endif
+        return try await recognizeText(cgImage: cgImage)
     }
 
     private static func readWordOpenXML(_ url: URL) throws -> String {
@@ -408,23 +466,13 @@ enum DocumentProcessor {
         throw ProcessingError.unsupportedFile
 #endif
 
-        return try await withCheckedThrowingContinuation { continuation in
-            let request = VNRecognizeTextRequest { request, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                    return
-                }
+        return try await recognizeText(cgImage: cgImage)
+    }
 
-                let text = (request.results as? [VNRecognizedTextObservation] ?? [])
-                    .compactMap { $0.topCandidates(1).first?.string }
-                    .joined(separator: "\n")
-
-                if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    continuation.resume(throwing: ProcessingError.emptyOCR)
-                } else {
-                    continuation.resume(returning: text)
-                }
-            }
+    private static func recognizeText(cgImage: CGImage) async throws -> String {
+        try Task.checkCancellation()
+        let text: String = try await withCheckedThrowingContinuation { continuation in
+            let request = VNRecognizeTextRequest()
 
             request.recognitionLevel = .accurate
             request.usesLanguageCorrection = true
@@ -434,11 +482,21 @@ enum DocumentProcessor {
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     try handler.perform([request])
+                    let text = (request.results ?? [])
+                        .compactMap { $0.topCandidates(1).first?.string }
+                        .joined(separator: "\n")
+                    if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        continuation.resume(throwing: ProcessingError.emptyOCR)
+                    } else {
+                        continuation.resume(returning: text)
+                    }
                 } catch {
                     continuation.resume(throwing: error)
                 }
             }
         }
+        try Task.checkCancellation()
+        return text
     }
 
     enum ProcessingError: LocalizedError {
@@ -454,7 +512,7 @@ enum DocumentProcessor {
             case .unsupportedFile:
                 return "暂不支持该文件类型，请先使用文本、PDF、图片、Word 或 PPT。"
             case .emptyPDF:
-                return "没有从 PDF 中提取到文字。扫描版 PDF 请先转成图片再导入。"
+                return "没有从 PDF 中提取到文字；请确认页面包含可识别内容。"
             case .emptyOCR:
                 return "图片 OCR 没有识别到文字，请换一张更清晰的图片。"
             case .emptyOfficeDocument:

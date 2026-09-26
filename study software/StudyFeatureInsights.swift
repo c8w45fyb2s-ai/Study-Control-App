@@ -292,10 +292,21 @@ struct DocumentSection: Identifiable {
     var excerpt: String
     var level: Int
     var ordinal: Int
+    var pageNumber: Int? = nil
 }
 
 enum DocumentSectionExtractor {
     static func extract(from document: StudyDocument) -> [DocumentSection] {
+        if !document.chunks.isEmpty {
+            return document.chunks.enumerated().map { ordinal, chunk in
+                DocumentSection(id: chunk.id, documentID: document.id,
+                    documentTitle: document.title,
+                    title: chunk.chapterTitle ?? "片段 \(ordinal + 1)",
+                    excerpt: chunk.text.compactedForStudyText(limit: 130),
+                    level: chunk.chapterTitle == nil ? 3 : 2, ordinal: ordinal + 1,
+                    pageNumber: chunk.startPage)
+            }
+        }
         let content = document.content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !content.isEmpty else { return [] }
 
@@ -330,7 +341,7 @@ enum DocumentSectionExtractor {
         snapshot.documents.flatMap { extract(from: $0) }
     }
 
-    private static func heading(from line: String) -> (title: String, level: Int)? {
+    static func heading(from line: String) -> (title: String, level: Int)? {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 2, trimmed.count <= 80 else { return nil }
         if trimmed.hasPrefix("#") {

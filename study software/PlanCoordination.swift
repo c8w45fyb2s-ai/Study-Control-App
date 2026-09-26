@@ -123,6 +123,7 @@ enum StudyEngineRegistry {
                 snapshot: state,
                 courseHasMaterials: courseMaterialIndex(in: state)
             ),
+            durationEstimator: TaskDurationEstimator(history: TaskDurationHistory(snapshot: state)),
             minimumPolicy: makeMinimumPlanPolicy(for: state, isManual: false)
         )
     }
@@ -901,7 +902,10 @@ struct StudyPlanCoordinator: DailyPlanCoordinator {
             candidates: candidates,
             existingPlans: existingPlans,
             completions: state.completionEvents,
-            inputFingerprint: fingerprint
+            inputFingerprint: fingerprint,
+            durationCalibrationCutoff: force ? context.now
+                : (activeExisting?.durationCalibrationCutoff ?? activeExisting?.createdAt ?? context.now),
+            forceReplan: force
         )
         let proposal = engine.proposePlan(request)
 

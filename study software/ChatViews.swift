@@ -13,6 +13,7 @@ struct ChatView: View {
     @EnvironmentObject private var store: AppStore
     @SceneStorage("chat.draft.question") private var inputText = ""
     @State private var editingPlanDraft: AIPlanDraft?
+    @State private var openedSource: SourceReference?
     @State private var shouldFollowConversationEnd = true
 
     private var trimmedInput: String {
@@ -107,7 +108,11 @@ struct ChatView: View {
                                         store.navigateToReviews()
                                     },
                                     onOpenCitation: { citation in
-                                        store.navigateToCitation(citation)
+                                        if let reference = citation.sourceReference {
+                                            openedSource = reference
+                                        } else {
+                                            store.navigateToCitation(citation)
+                                        }
                                     }
                                 )
                                     .id(message.id)
@@ -209,6 +214,9 @@ struct ChatView: View {
                     editingPlanDraft = nil
                 }
             )
+        }
+        .sheet(isPresented: Binding(get: { openedSource != nil }, set: { if !$0 { openedSource = nil } })) {
+            if let openedSource { SourceLocationView(reference: openedSource).environmentObject(store) }
         }
     }
 
@@ -388,7 +396,7 @@ private struct ChatWorkbenchHeader: View {
     }
 
     private var referenceTitle: String {
-        referenceCount == 0 ? "暂无引用" : "\(referenceCount) 条引用"
+        referenceCount == 0 ? "暂无候选资料" : "\(referenceCount) 条候选资料"
     }
 
     var body: some View {
@@ -2776,7 +2784,7 @@ private struct ChatInputDock: View {
     let onTogglePersonalContext: () -> Void
 
     private var referenceTitle: String {
-        referenceCount == 0 ? "无引用" : "\(referenceCount) 条引用"
+        referenceCount == 0 ? "无候选资料" : "\(referenceCount) 条候选资料"
     }
 
     private var contextTitle: String {
@@ -2814,7 +2822,7 @@ private struct ChatInputDock: View {
                     }
                 }
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel("回答模式：\(answerMode.label)；\(contextTitle)；引用范围：\(referenceTitle)")
+                .accessibilityLabel("回答模式：\(answerMode.label)；\(contextTitle)；检索候选：\(referenceTitle)")
 
                 Spacer(minLength: StudyDesign.Spacing.micro)
 
@@ -3048,7 +3056,7 @@ struct RetrievedContextList: View {
     var body: some View {
         VStack(alignment: .leading, spacing: StudyDesign.Spacing.standard) {
             HStack(alignment: .firstTextBaseline) {
-                Label("本轮检索资料", systemImage: "doc.text.magnifyingglass")
+                Label("检索候选资料", systemImage: "doc.text.magnifyingglass")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(StudyDesign.Colors.labelPrimary)
                 Spacer()

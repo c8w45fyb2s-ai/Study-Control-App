@@ -15,6 +15,7 @@ struct RetrievedStudyContext: Identifiable {
     var title: String
     var excerpt: String
     var score: Int
+    var sourceReference: SourceReference? = nil
 
     var label: String {
         "\(kind.rawValue)：\(title)"
@@ -33,7 +34,7 @@ struct StudyContextRetrieval {
             """
             [资料 \(index + 1)] \(item.kind.rawValue)
             标题：\(item.title)
-            内容：\(item.excerpt)
+            \(item.kind == .document ? "定位：\(item.sourceReference?.pageLabel ?? "旧资料暂无页码")\n" : "")内容：\(item.excerpt)
             """
         }.joined(separator: "\n\n")
     }
@@ -45,16 +46,45 @@ struct StudyContextRetrieval {
                 title: item.title,
                 excerpt: item.excerpt,
                 sourceID: item.sourceID,
-                promptIndex: index + 1
+                promptIndex: index + 1,
+                sourceReference: item.sourceReference
             )
         }
+    }
+
+    private static let citationPattern = try? NSRegularExpression(pattern: #"\[资料\s*([0-9]+)\]"#)
+
+    /// 一次解析同时清理无效编号、按回答中的出现顺序收集实际引用。
+    func resolvingCitations(in answer: String) -> (answer: String, citations: [ChatMessageCitation]) {
+        guard let regex = Self.citationPattern else { return (answer, []) }
+        var seen = Set<Int>()
+        let candidates = citations
+        var cited: [ChatMessageCitation] = []
+        var cleaned = ""
+        var cursor = answer.startIndex
+        let matches = regex.matches(in: answer, range: NSRange(answer.startIndex..<answer.endIndex, in: answer))
+        for match in matches {
+            guard let wholeRange = Range(match.range, in: answer),
+                  let numberRange = Range(match.range(at: 1), in: answer) else { continue }
+            cleaned += answer[cursor..<wholeRange.lowerBound]
+            if let number = Int(answer[numberRange]), candidates.indices.contains(number - 1) {
+                cleaned += answer[wholeRange]
+                if seen.insert(number).inserted { cited.append(candidates[number - 1]) }
+            }
+            cursor = wholeRange.upperBound
+        }
+        cleaned += answer[cursor...]
+        return (cleaned, cited)
     }
 }
 
 enum StudyContextRetriever {
-    static func retrieve(query: String, snapshot: StoreSnapshot, limit: Int = 14, now: Date = Date()) -> StudyContextRetrieval {
+    static func retrieve(query: String, snapshot: StoreSnapshot, limit: Int = 14,
+                         maxContextCharacters: Int = 16_000, now: Date = Date()) -> StudyContextRetrieval {
         let terms = SearchText.terms(from: query)
         let wantsStudyPlanning = SearchText.looksLikeStudyPlanningQuery(query, terms: terms)
+        let hasSubjectTerms = SearchText.hasSubjectIntent(query)
+        let purpose: RetrievalPurpose = wantsStudyPlanning ? (hasSubjectTerms ? .mixed : .planning) : .subject
         guard !terms.isEmpty || wantsStudyPlanning else { return StudyContextRetrieval(items: []) }
 
         var items: [RetrievedStudyContext] = []
@@ -73,7 +103,8 @@ enum StudyContextRetriever {
                     答案：\(mistake.correctAnswer)
                     错因：\(mistake.errorReason)
                     """,
-                    score: score
+                    score: score,
+                    sourceReference: mistake.sourceReference
                 )
             )
         }
@@ -93,7 +124,8 @@ enum StudyContextRetriever {
                     掌握度：\(Int(point.mastery * 100))%
                     说明：\(point.summary)
                     """,
-                    score: score
+                    score: score,
+                    sourceReference: point.sourceReference
                 )
             )
         }
@@ -103,23 +135,21 @@ enum StudyContextRetriever {
         }
 
         for document in snapshot.documents {
-            let text = [document.title, document.sourceName, document.kind.rawValue, document.content].joined(separator: "\n")
-            let score = SearchText.score(terms: terms, title: document.title, body: text)
-            guard score > 0 else { continue }
-            let excerpt = SearchText.excerpt(from: document.content, terms: terms, fallbackLimit: 1_200)
-            items.append(
-                RetrievedStudyContext(
-                    kind: .document,
-                    sourceID: document.id,
-                    title: document.title,
-                    excerpt: """
-                    类型：\(document.kind.rawValue)
-                    来源：\(document.sourceName)
-                    摘录：\(excerpt)
-                    """,
-                    score: score
-                )
-            )
+            let chunks = document.chunks.isEmpty
+                ? DocumentChunkBuilder.build(documentID: document.id, content: document.content, pages: document.pages)
+                : document.chunks
+            let matches = chunks.compactMap { chunk -> RetrievedStudyContext? in
+                let heading = chunk.chapterTitle ?? ""
+                let score = SearchText.score(terms: terms, title: document.title + " " + heading, body: chunk.text)
+                guard score > 0 else { return nil }
+                let excerpt = SearchText.excerpt(from: chunk.text, terms: terms, fallbackLimit: 850)
+                let reference = SourceReference(documentID: document.id, chunkID: chunk.id,
+                    pageNumber: chunk.startPage, excerpt: excerpt)
+                return RetrievedStudyContext(kind: .document, sourceID: document.id,
+                    title: heading.isEmpty ? document.title : "\(document.title) · \(heading)",
+                    excerpt: excerpt, score: score + 16, sourceReference: reference)
+            }
+            items.append(contentsOf: matches.sorted { $0.score > $1.score }.prefix(2))
         }
 
         items.append(contentsOf: reviewTaskContexts(
@@ -137,14 +167,52 @@ enum StudyContextRetriever {
         let ranked = items
             .deduplicatedForRetrieval()
             .sorted {
-                if $0.score != $1.score {
-                    return $0.score > $1.score
+                let lhsScore = $0.score + purpose.boost(for: $0.kind)
+                let rhsScore = $1.score + purpose.boost(for: $1.kind)
+                if lhsScore != rhsScore {
+                    return lhsScore > rhsScore
                 }
                 return $0.title < $1.title
             }
-            .prefix(limit)
+        let ordered: [RetrievedStudyContext]
+        if purpose == .mixed {
+            let subjectItems = ranked.filter { $0.kind == .document || $0.kind == .knowledge || $0.kind == .mistake }
+            let planningItems = ranked.filter { $0.kind == .reviewTask || $0.kind == .goal }
+            var interleaved: [RetrievedStudyContext] = []
+            for index in 0..<max(subjectItems.count, planningItems.count) {
+                if index < subjectItems.count { interleaved.append(subjectItems[index]) }
+                if index < planningItems.count { interleaved.append(planningItems[index]) }
+            }
+            ordered = interleaved
+        } else {
+            ordered = ranked
+        }
+        var selected: [RetrievedStudyContext] = []
+        var usedCharacters = 0
+        var documentCounts: [UUID: Int] = [:]
+        let characterLimit = max(300, maxContextCharacters)
+        for item in ordered {
+            guard selected.count < limit else { break }
+            if item.kind == .document, let id = item.sourceID, documentCounts[id, default: 0] >= 2 { continue }
+            if purpose == .subject && item.kind == .reviewTask && selected.filter({ $0.kind == .reviewTask }).count >= 2 { continue }
+            if purpose == .mixed && item.kind == .reviewTask && selected.filter({ $0.kind == .reviewTask }).count >= max(1, limit / 3) { continue }
+            let cost = item.title.count + item.excerpt.count + 90
+            guard usedCharacters + cost <= characterLimit else { continue }
+            selected.append(item)
+            usedCharacters += cost
+            if item.kind == .document, let id = item.sourceID { documentCounts[id, default: 0] += 1 }
+        }
+        return StudyContextRetrieval(items: selected)
+    }
 
-        return StudyContextRetrieval(items: Array(ranked))
+    private enum RetrievalPurpose { case subject, planning, mixed
+        func boost(for kind: RetrievedStudyContext.Kind) -> Int {
+            switch self {
+            case .subject: return kind == .document ? 45 : (kind == .reviewTask || kind == .goal ? -80 : 20)
+            case .planning: return kind == .reviewTask ? 45 : (kind == .goal ? 30 : 0)
+            case .mixed: return kind == .document ? 20 : (kind == .reviewTask ? 15 : 0)
+            }
+        }
     }
 
     private static func weakKnowledgeContexts(snapshot: StoreSnapshot) -> [RetrievedStudyContext] {
@@ -207,7 +275,7 @@ enum StudyContextRetriever {
                     urgencyLabel = "后续任务"
                 }
 
-                guard wantsStudyPlanning || keywordScore > 0 || urgencyScore >= 135 else {
+                guard wantsStudyPlanning || keywordScore > 0 else {
                     return nil
                 }
 
@@ -222,7 +290,7 @@ enum StudyContextRetriever {
                     间隔状态：\(task.sm2Description)
                     关联：\(linkedText)
                     """,
-                    score: urgencyScore + keywordScore
+                    score: (wantsStudyPlanning ? urgencyScore : 0) + keywordScore
                 )
             }
     }
@@ -291,6 +359,19 @@ enum StudyContextRetriever {
 }
 
 private enum SearchText {
+    static let planningTerms: Set<String> = ["今天", "今日", "本周", "复习", "学习", "任务", "计划", "规划", "安排", "备考", "study", "review", "plan", "schedule"]
+    static func hasSubjectIntent(_ query: String) -> Bool {
+        var remainder = query.lowercased()
+        let genericWords = ["今天", "今日", "本周", "这个月", "每天", "每日", "复习", "学习", "任务", "计划", "规划", "安排", "备考",
+                            "应该", "如何", "怎么", "怎样", "什么", "哪些", "先后", "一下", "我的", "我", "的", "吗", "呢", "先", "学",
+                            "today", "study", "review", "plan", "schedule", "what", "how", "should", "my"]
+        for word in genericWords.sorted(by: { $0.count > $1.count }) {
+            remainder = remainder.replacingOccurrences(of: word, with: "")
+        }
+        return remainder.unicodeScalars.contains { scalar in
+            (0x4E00...0x9FFF).contains(Int(scalar.value)) || CharacterSet.letters.contains(scalar)
+        }
+    }
     static func terms(from query: String) -> [String] {
         let normalized = query.lowercased()
         let separators = CharacterSet.alphanumerics.inverted
@@ -331,7 +412,6 @@ private enum SearchText {
             return true
         }
 
-        let planningTerms = Set(["今天", "今日", "本周", "复习", "学习", "任务", "计划", "规划", "安排", "备考", "study", "review", "plan", "schedule"])
         return terms.contains { planningTerms.contains($0) }
     }
 
@@ -399,7 +479,7 @@ private extension Array where Element == RetrievedStudyContext {
         var seen = Set<String>()
         var result: [RetrievedStudyContext] = []
         for item in self {
-            let key = "\(item.kind.rawValue)|\(item.title)"
+            let key = "\(item.kind.rawValue)|\(item.sourceReference?.chunkID ?? item.title)"
             guard !seen.contains(key) else { continue }
             seen.insert(key)
             result.append(item)

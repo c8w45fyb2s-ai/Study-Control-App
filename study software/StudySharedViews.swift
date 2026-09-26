@@ -727,22 +727,3 @@ extension View {
 #endif
     }
 }
-
-struct SectionBlock<Content: View>: View {
-    var title: String
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: StudyDesign.Spacing.normal) {
-            Text(title)
-                .font(.title2.weight(.semibold))
-            VStack(alignment: .leading, spacing: StudyDesign.Spacing.normal) {
-                content
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding()
-            .background(StudyDesign.Colors.surfaceFill)
-            .clipShape(RoundedRectangle(cornerRadius: StudyDesign.Radius.small))
-        }
-    }
-}

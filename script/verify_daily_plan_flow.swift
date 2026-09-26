@@ -348,11 +348,10 @@ struct DailyPlanVerifyHarness {
         testEnergyCoefficientAndUserOverride()
         testStudiedMinutesCountTowardDailyCap()
         testMinimumPlanPolicyIntegration()
-        #if CAN_USE_REAL_MINIMUM_POLICY
         testRealMinimumPolicySeam()
-        #endif
         testOfflineWithoutSignalIndex()
         testExplanationAnswersWhy()
+        testHistoricalDurationCalibration()
 
         print("")
         print("Daily plan flow verification complete. passed=\(passed) failed=\(failed)")
@@ -1151,7 +1150,6 @@ struct DailyPlanVerifyHarness {
         checkEqual(policyDisabled.callCount, 0, "关闭自动减量时不调用减量策略")
     }
 
-    #if CAN_USE_REAL_MINIMUM_POLICY
 
     // MARK: - 18b. 与 D 的真实策略对接
 
@@ -1198,7 +1196,6 @@ struct DailyPlanVerifyHarness {
         )
     }
 
-    #endif
 
     // MARK: - 19. 无索引 / 离线
 
@@ -1257,5 +1254,136 @@ struct DailyPlanVerifyHarness {
             !proposal.explanation.blockedReasons.isEmpty,
             "有排不下的任务时解释给出受阻原因"
         )
+    }
+
+    // MARK: - 21. 真实耗时校准
+
+    static func testHistoricalDurationCalibration() {
+        print("--- 按同类真实完成记录校准耗时 ---")
+        let mathPoint = KnowledgePoint(title: "函数", subject: "数学", summary: "", mastery: 0.5)
+        let englishPoint = KnowledgePoint(title: "语法", subject: "英语", summary: "", mastery: 0.5)
+        let mathTask = ReviewTask(title: "函数练习", dueDate: now, knowledgePointID: mathPoint.id)
+        let englishTask = ReviewTask(title: "语法练习", dueDate: now, knowledgePointID: englishPoint.id)
+        let source = DailyPlanItemSource.reviewTask(mathTask.id, knowledgePointID: mathPoint.id)
+        var snapshot = StoreSnapshot()
+        snapshot.knowledgePoints = [mathPoint, englishPoint]
+        snapshot.reviewTasks = [mathTask, englishTask]
+
+        func event(_ id: UUID = UUID(), source eventSource: DailyPlanItemSource?,
+                   scope: StudyScope, minutes: Int, at time: Date,
+                   durationSource: StudyDurationSource = .manualEntry,
+                   sessionID: UUID? = nil) -> CompletionEvent {
+            CompletionEvent(id: id, idempotencyKey: id.uuidString, sessionID: sessionID,
+                            dayKey: dayKey, source: eventSource, completedScope: scope,
+                            tier: .studied, actualMinutes: minutes, durationSource: durationSource,
+                            completedAt: time, createdAt: time)
+        }
+
+        let firstTime = now.addingTimeInterval(-7200)
+        for index in 0..<4 {
+            snapshot.completionEvents.append(event(source: source, scope: .questions(10),
+                minutes: 35, at: firstTime.addingTimeInterval(Double(index * 60))))
+        }
+        let cutoff = now.addingTimeInterval(-1800)
+        let four = TaskDurationHistory(snapshot: snapshot)
+        check(four.calibration(for: source, scope: .questions(10), before: cutoff) == nil,
+              "不足五条有效同类记录时沿用原规则")
+
+        // 第五次会话经过 60 分钟，其中暂停 25 分钟，实际有效学习 35 分钟。
+        let sessionID = UUID()
+        let sessionStart = now.addingTimeInterval(-4800)
+        let sessionEnd = sessionStart.addingTimeInterval(3600)
+        snapshot.studySessions.append(StudySession(id: sessionID, dayKey: dayKey,
+            startedAt: sessionStart, endedAt: sessionEnd,
+            pauses: [StudyPauseInterval(startedAt: sessionStart.addingTimeInterval(1200),
+                                        endedAt: sessionStart.addingTimeInterval(2700))],
+            state: .finished, createdAt: sessionStart, updatedAt: sessionEnd))
+        snapshot.completionEvents.append(event(source: source, scope: .questions(10),
+            minutes: 60, at: sessionEnd, durationSource: .timed, sessionID: sessionID))
+        let history = TaskDurationHistory(snapshot: snapshot)
+        checkEqual(history.calibration(for: source, scope: .questions(10), before: now)?.minutes,
+                   35, "真实计时扣除暂停后，以每题耗时估计 10 题")
+        checkEqual(history.calibration(for: source, scope: .questions(10), before: now)?.sampleCount,
+                   5, "达到五条有效样本后启用校准")
+
+        snapshot.completionEvents.append(event(source: source, scope: .questions(10),
+            minutes: 1000, at: now.addingTimeInterval(-60)))
+        snapshot.completionEvents.append(event(source: source, scope: .questions(10),
+            minutes: 0, at: now.addingTimeInterval(-50), durationSource: .unrecorded))
+        let revoked = event(source: source, scope: .questions(10), minutes: 1,
+                            at: now.addingTimeInterval(-40)).revoked(at: now, reason: "测试撤销")
+        snapshot.completionEvents.append(revoked)
+        snapshot.completionEvents.append(event(source: source, scope: .questions(10),
+            minutes: 1, at: now.addingTimeInterval(60)))
+        snapshot.completionEvents.append(event(source: source, scope: .pages(10),
+            minutes: 1, at: now.addingTimeInterval(-30)))
+        snapshot.completionEvents.append(event(source: .reviewTask(englishTask.id, knowledgePointID: englishPoint.id),
+            scope: .questions(10), minutes: 1, at: now.addingTimeInterval(-30)))
+        snapshot.completionEvents.append(event(source: .manual(manualTaskID: UUID()),
+            scope: .questions(10), minutes: 1, at: now.addingTimeInterval(-30)))
+        let robust = TaskDurationHistory(snapshot: snapshot)
+        checkEqual(robust.calibration(for: source, scope: .questions(10), before: now)?.minutes,
+                   35, "中位数不受一次异常长记录影响")
+        checkEqual(robust.calibration(for: source, scope: .questions(10), before: now)?.sampleCount,
+                   6, "未记录、撤销、未来、其他科目类型和单位均不计入样本")
+
+        let oldPlanID = UUID()
+        let oldItem = DailyPlanItem(planID: oldPlanID, source: source, title: "历史函数练习",
+            plannedScope: .questions(10), estimatedMinutes: 35, scheduledDayKey: dayKey,
+            createdAt: firstTime, updatedAt: firstTime)
+        snapshot.dailyPlans = [DailyStudyPlan(id: oldPlanID, dayKey: dayKey, budget: DailyPlanBudget(
+            capacityMinutes: 60, dailyCapMinutes: nil, plannedMinutes: 35),
+            goal: DailyPlanGoal(targetMinutes: 35, targetScope: nil, label: "历史计划"),
+            explanation: DailyPlanExplanation(lines: []), items: [oldItem],
+            createdAt: firstTime, updatedAt: firstTime)]
+        var oldEvent = event(source: nil, scope: .questions(10), minutes: 35,
+                             at: now.addingTimeInterval(-20))
+        oldEvent.planItemID = oldItem.id
+        snapshot.completionEvents.append(oldEvent)
+        checkEqual(TaskDurationHistory(snapshot: snapshot).calibration(
+            for: source, scope: .questions(10), before: now)?.sampleCount, 7,
+            "旧事件仅有计划项 ID 时可从明确的历史计划恢复分类")
+
+        let candidate = PlanCandidate(source: source, title: "函数练习", plannedScope: .questions(10),
+            estimatedMinutes: 60)
+        let estimator = TaskDurationEstimator(history: robust)
+        let built = TaskCandidateBuilder.build(TaskCandidateInput(dayKey: dayKey, context: context,
+            rawCandidates: [candidate], signalIndex: .empty)).candidates.first!
+        let before = estimator.estimate(for: built, risk: .low,
+            preferences: preferences().planning, before: cutoff)
+        let after = estimator.estimate(for: built, risk: .low,
+            preferences: preferences().planning, before: now)
+        checkEqual(before.minutes, 60, "旧校准截点不读取后来完成的样本")
+        checkEqual(after.minutes, 35, "有数量时历史单位速度替代原规则基准")
+        check(after.explanation?.contains("最近 6 次") == true,
+              "计划项给出历史样本数及任务量的简短解释")
+        checkEqual(after, estimator.estimate(for: built, risk: .low,
+            preferences: preferences().planning, before: now), "相同输入的估计确定一致")
+
+        let planEngine = LocalDailyPlanEngine(durationEstimator: estimator)
+        let day = availability([free(19, 0, 180)])
+        let first = planEngine.proposePlan(DailyPlanRequest(dayKey: dayKey, context: context,
+            availability: day, preferences: preferences(), candidates: [candidate],
+            inputFingerprint: "duration-stable", durationCalibrationCutoff: cutoff))
+        let reused = planEngine.proposePlan(DailyPlanRequest(dayKey: dayKey, context: context,
+            availability: day, preferences: preferences(), candidates: [candidate],
+            existingPlans: [first.plan], inputFingerprint: "duration-stable",
+            durationCalibrationCutoff: cutoff))
+        check(reused.didReuseExistingPlan, "普通刷新复用同一计划估计")
+        let replanned = planEngine.proposePlan(DailyPlanRequest(dayKey: dayKey, context: context,
+            availability: day, preferences: preferences(), candidates: [candidate],
+            existingPlans: [first.plan], inputFingerprint: "duration-stable",
+            durationCalibrationCutoff: now, forceReplan: true))
+        check(!replanned.didReuseExistingPlan, "用户重新规划会使用新的校准截点")
+        check(replanned.plan.items.first?.estimatedMinutes != first.plan.items.first?.estimatedMinutes,
+              "新记录只在主动重新规划后改变待办估计")
+        var completed = first.plan
+        completed.items[0].status = .completed
+        let withCompleted = planEngine.proposePlan(DailyPlanRequest(dayKey: dayKey, context: context,
+            availability: day, preferences: preferences(), candidates: [candidate],
+            existingPlans: [completed], inputFingerprint: "duration-stable",
+            durationCalibrationCutoff: now, forceReplan: true))
+        checkEqual(withCompleted.plan.items.first?.estimatedMinutes, completed.items.first?.estimatedMinutes,
+                   "已完成计划项在重新规划时保持原估计")
     }
 }

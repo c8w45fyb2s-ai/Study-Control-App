@@ -64,6 +64,7 @@ struct ReviewsView: View {
     @State private var sort: ReviewSort = .dueSoon
     @State private var balanceFeedback: String?
     @State private var loadBalanceUndo: ReviewLoadBalanceUndo?
+    @State private var showingCardEditor = false
 
     private var subjectOptions: [String] {
         let allSubjects = store.snapshot.reviewTasks
@@ -279,6 +280,9 @@ struct ReviewsView: View {
 
                     Spacer()
 
+                    Button("新建卡片") { showingCardEditor = true }
+                        .buttonStyle(.bordered)
+
                     if isFilteringQueue {
                         Text("已调整")
                             .reviewMetaPill(tint: StudyDesign.Colors.secondary)
@@ -310,6 +314,9 @@ struct ReviewsView: View {
             .frame(maxWidth: StudyDesign.Layout.contentMaxWidth, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .center)
             .studyScrollBottomComfort()
+        }
+        .sheet(isPresented: $showingCardEditor) {
+            StudyCardEditor(existing: nil).environmentObject(store)
         }
     }
 }
@@ -1073,6 +1080,8 @@ struct ReviewTaskRow: View {
     @State private var isCompleting = false
     @State private var hasAppeared = false
     @State private var completionBounce = false
+    @State private var practiceCard: StudyCard?
+    @State private var showingCardEditor = false
     @Namespace private var qualitySelectionNamespace
     var task: ReviewTask
 
@@ -1130,6 +1139,8 @@ struct ReviewTaskRow: View {
             reviewTaskContent
         }
         .contextMenu {
+            Button("应用内作答") { openPractice() }
+            Button("编辑卡片") { showingCardEditor = true }
             if currentTask.status == .pending {
                 Button {
                     setQualityPickerVisible(true)
@@ -1186,6 +1197,15 @@ struct ReviewTaskRow: View {
         .sheet(isPresented: $isEditing) {
             ReviewTaskEditSheetWrapper(task: currentTask)
         }
+        .sheet(item: $practiceCard) { card in
+            ActiveRecallView(initialCardID: card.id).environmentObject(store)
+        }
+        .sheet(isPresented: $showingCardEditor) {
+            StudyCardEditor(existing: store.card(for: currentTask), initialPrompt: currentTask.title,
+                knowledgePointID: currentTask.knowledgePointID, mistakeID: currentTask.mistakeID,
+                linkedReviewTaskID: currentTask.id)
+                .environmentObject(store)
+        }
         .alert("删除这个复习任务？", isPresented: $isShowingDeleteConfirmation) {
             Button("删除", role: .destructive) {
                 store.deleteReviewTask(currentTask)
@@ -1199,6 +1219,8 @@ struct ReviewTaskRow: View {
     @ViewBuilder
     private var reviewTaskContent: some View {
         VStack(alignment: .leading, spacing: StudyDesign.Spacing.tight) {
+            Button("应用内作答") { openPractice() }
+                .buttonStyle(.borderedProminent)
 #if os(iOS)
             taskSummary
                 .layoutPriority(1)
@@ -1223,6 +1245,14 @@ struct ReviewTaskRow: View {
                 mobileTaskActionRow
             }
 #endif
+        }
+    }
+
+    private func openPractice() {
+        if let card = store.ensureCard(for: currentTask) {
+            practiceCard = card
+        } else {
+            showingCardEditor = true
         }
     }
 
@@ -1387,7 +1417,7 @@ struct ReviewTaskRow: View {
         Button {
             setQualityPickerVisible(true)
         } label: {
-            StudyActionPillLabel(title: "完成", systemImage: "checkmark")
+            StudyActionPillLabel(title: "线下自评", systemImage: "checkmark")
         }
         .buttonStyle(StudyActionPillButtonStyle(tint: StudyDesign.Colors.primary, prominence: .primary, size: .compact, minWidth: 82))
         .iOSTouchTarget()
@@ -1418,7 +1448,7 @@ struct ReviewTaskRow: View {
     private var qualityPickerButtons: some View {
         VStack(alignment: .leading, spacing: StudyDesign.Spacing.tight) {
             HStack(spacing: StudyDesign.Spacing.tight) {
-                Text("本次复习感觉如何？")
+                Text("线下学习后，本次复习感觉如何？")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(StudyDesign.Colors.labelSecondary)
 

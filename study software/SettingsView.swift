@@ -26,6 +26,7 @@ struct SettingsView: View {
     @SceneStorage("settings.draft.allowStructuredPlanRequests") private var allowStructuredPlanRequests = true
     @SceneStorage("settings.draft.includePersonalContext") private var includePersonalContextInAnswers = true
     @SceneStorage("settings.draft.keepDocumentContent") private var keepDocumentContent = true
+    @SceneStorage("settings.draft.keepOriginalPDF") private var keepOriginalPDF = false
     @SceneStorage("settings.draft.maxChunkCharacters") private var maxAnalysisChunkCharacters = 12_000
     @SceneStorage("settings.draft.inputTokenCost") private var inputTokenCostPerMillion = 0.0
     @SceneStorage("settings.draft.outputTokenCost") private var outputTokenCostPerMillion = 0.0
@@ -35,9 +36,12 @@ struct SettingsView: View {
     @State private var connectionTestState: ModelConnectionTestState = .idle
     @State private var isExportingBackup = false
     @State private var isExportingPrivacyBackup = false
+    @State private var backupExportDocument: ExportDocument?
+    @State private var privacyExportDocument: ExportDocument?
     @State private var isExportingMarkdown = false
     @State private var isExportingAnki = false
     @State private var isImportingBackup = false
+    @State private var backupImportMode: BackupImportMode = .replace
     @State private var showAdvancedSettings = false
     @State private var showModelConnection = false
     @State private var showUsageDetails = false
@@ -62,20 +66,22 @@ struct SettingsView: View {
         .scrollDismissesKeyboard(.interactively)
         .fileExporter(
             isPresented: $isExportingBackup,
-            document: store.makeBackupDocument(),
+            document: backupExportDocument,
             contentType: .json,
             defaultFilename: "StudyCompanionBackup.json"
         ) { result in
+            backupExportDocument = nil
             if case .failure(let error) = result {
                 store.statusMessage = "导出备份失败：\(error.localizedDescription)"
             }
         }
         .fileExporter(
             isPresented: $isExportingPrivacyBackup,
-            document: store.makePrivacyBackupDocument(),
+            document: privacyExportDocument,
             contentType: .json,
             defaultFilename: "StudyCompanionPrivacyBackup.json"
         ) { result in
+            privacyExportDocument = nil
             if case .failure(let error) = result {
                 store.statusMessage = "导出隐私备份失败：\(error.localizedDescription)"
             }
@@ -108,7 +114,7 @@ struct SettingsView: View {
             switch result {
             case .success(let urls):
                 if let url = urls.first {
-                    store.importBackup(url: url)
+                    store.importBackup(url: url, mode: backupImportMode)
                 }
             case .failure(let error):
                 store.statusMessage = "导入备份失败：\(error.localizedDescription)"
@@ -152,6 +158,7 @@ struct SettingsView: View {
             allowStructuredPlanRequests = store.settings.allowStructuredPlanRequests
             includePersonalContextInAnswers = store.settings.includePersonalContextInAnswers
             keepDocumentContent = store.settings.keepDocumentContent
+            keepOriginalPDF = store.settings.keepOriginalPDF
             appearanceModeRaw = store.settings.appearanceMode.rawValue
             answerModeRaw = store.settings.answerMode.rawValue
             maxAnalysisChunkCharacters = store.settings.maxAnalysisChunkCharacters
@@ -259,6 +266,7 @@ struct SettingsView: View {
         || allowStructuredPlanRequests != store.settings.allowStructuredPlanRequests
         || includePersonalContextInAnswers != store.settings.includePersonalContextInAnswers
         || keepDocumentContent != store.settings.keepDocumentContent
+        || keepOriginalPDF != store.settings.keepOriginalPDF
         || answerMode != store.settings.answerMode
         || maxAnalysisChunkCharacters != store.settings.maxAnalysisChunkCharacters
         || inputTokenCostPerMillion != store.settings.inputTokenCostPerMillion
@@ -498,7 +506,8 @@ struct SettingsView: View {
             answerMode: answerMode,
             maxAnalysisChunkCharacters: maxAnalysisChunkCharacters,
             inputTokenCostPerMillion: inputTokenCostPerMillion,
-            outputTokenCostPerMillion: outputTokenCostPerMillion
+            outputTokenCostPerMillion: outputTokenCostPerMillion,
+            keepOriginalPDF: keepOriginalPDF
         ) else { return }
         connectionTestState = .idle
     }
@@ -584,6 +593,7 @@ struct SettingsView: View {
                             .accessibilityHint(allowModelRequests ? "开启或关闭结构化规划请求" : "先开启允许模型请求后，再使用结构化规划。")
                         SettingsToggleRow(title: "答疑引用个人资料", subtitle: "回答问题时检索错题、笔记和知识点。", tint: StudyDesign.Colors.secondary, isOn: $includePersonalContextInAnswers)
                         SettingsToggleRow(title: "本地保存导入原文", subtitle: "便于后续重新分析和检索。", tint: StudyDesign.Colors.success, isOn: $keepDocumentContent)
+                        SettingsToggleRow(title: "保留 PDF 原文件", subtitle: "复制到应用管理目录以便打开原页；关闭并保存时移除已保留的 PDF。", tint: StudyDesign.Colors.secondary, isOn: $keepOriginalPDF)
                         Text("关闭模型请求后，资料仍可保存在本地，但不会发送给当前 AI 服务。")
                             .font(.caption)
                             .foregroundStyle(StudyDesign.Colors.labelSecondary)
@@ -905,12 +915,27 @@ struct SettingsView: View {
                             store.reloadStoredData()
                         }
                         dataAction(label: "导出完整备份", icon: "square.and.arrow.up") {
-                            isExportingBackup = true
+                            do {
+                                backupExportDocument = try store.makeBackupDocument()
+                                isExportingBackup = true
+                            } catch {
+                                store.statusMessage = "准备完整备份失败：\(error.localizedDescription)"
+                            }
                         }
                         dataAction(label: "导出隐私备份", icon: "lock.doc") {
-                            isExportingPrivacyBackup = true
+                            do {
+                                privacyExportDocument = try store.makePrivacyBackupDocument()
+                                isExportingPrivacyBackup = true
+                            } catch {
+                                store.statusMessage = "准备隐私备份失败：\(error.localizedDescription)"
+                            }
                         }
                         dataAction(label: "导入完整备份", icon: "square.and.arrow.down") {
+                            backupImportMode = .replace
+                            isImportingBackup = true
+                        }
+                        dataAction(label: "合并导入另一端备份", icon: "arrow.triangle.2.circlepath") {
+                            backupImportMode = .merge
                             isImportingBackup = true
                         }
                         dataAction(label: "导出 Markdown 汇总", icon: "doc.text") {
@@ -919,7 +944,7 @@ struct SettingsView: View {
                         dataAction(label: "导出 Anki 牌组", icon: "rectangle.stack") {
                             isExportingAnki = true
                         }
-                        Text("完整备份不包含 Keychain 中的 API Key。")
+                        Text("导入完整备份会替换本机数据；合并导入只追加不同 ID 的记录，同 ID 冲突保留本机版本。完整备份不包含 Keychain 中的 API Key。")
                             .font(.caption)
                             .foregroundStyle(StudyDesign.Colors.labelSecondary)
                             .frame(maxWidth: .infinity, alignment: .leading)

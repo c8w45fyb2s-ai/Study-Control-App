@@ -597,7 +597,7 @@ struct DocumentSectionsView: View {
                                 ForEach(documentSections.prefix(8)) { section in
                                     CalendarDetailRow(
                                         title: "\(section.ordinal). \(section.title)",
-                                        subtitle: section.excerpt,
+                                        subtitle: "\(section.pageNumber.map { "第 \($0) 页 · " } ?? "旧资料暂无页码 · ")\(section.excerpt)",
                                         icon: section.level <= 2 ? "text.book.closed.fill" : "text.alignleft",
                                         tint: StudyDesign.Colors.secondary
                                     )

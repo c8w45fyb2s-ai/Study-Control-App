@@ -276,6 +276,43 @@ struct AIPlanFlowVerifier {
         let planningCitations = planningRetrieval.citations
         check(planningCitations.contains { $0.kind == .knowledge && $0.sourceID == weakPointID && $0.promptIndex > 0 }, "检索结果会生成可跳转的知识点引用")
         check(planningCitations.contains { $0.kind == .reviewTask && $0.title == "完成 C 语言指针练习" && $0.sourceID != nil }, "检索结果会生成可跳转的复习任务引用")
+        var mathDocument = StudyDocument(title: "数学教材", sourceName: "math.pdf", kind: .note,
+                                         content: "勾股定理说明直角三角形两条直角边平方和等于斜边平方。")
+        mathDocument.pages = [DocumentPage(documentID: mathDocument.id, pageNumber: 3,
+                                           text: mathDocument.content, method: .nativeText,
+                                           state: .succeeded, failureReason: nil)]
+        mathDocument.chunks = DocumentChunkBuilder.build(documentID: mathDocument.id,
+                                                         content: mathDocument.content, pages: mathDocument.pages)
+        var subjectSnapshot = StoreSnapshot()
+        subjectSnapshot.documents = [mathDocument]
+        subjectSnapshot.reviewTasks = [ReviewTask(title: "英语单词复习", dueDate: fixedDate(2026, 6, 19, 22))]
+        let subjectRetrieval = StudyContextRetriever.retrieve(query: "勾股定理是什么", snapshot: subjectSnapshot,
+                                                              limit: 4, now: fixedDate(2026, 6, 20, 9))
+        check(subjectRetrieval.items.contains { $0.kind == .document && $0.sourceReference?.pageNumber == 3 },
+              "学科答疑命中有真实页码的教材分块")
+        check(!subjectRetrieval.items.contains { $0.kind == .reviewTask }, "无关到期英语任务不挤占数学答疑")
+        let mixedRetrieval = StudyContextRetriever.retrieve(query: "今天怎么复习勾股定理", snapshot: subjectSnapshot,
+                                                            limit: 4, now: fixedDate(2026, 6, 20, 9))
+        check(mixedRetrieval.items.contains { $0.kind == .document } && mixedRetrieval.items.contains { $0.kind == .reviewTask },
+              "混合问题分别召回学科证据和规划任务")
+        let resolvedCitation = subjectRetrieval.resolvingCitations(in: "根据教材[资料 1]，另见[资料 999]")
+        check(resolvedCitation.citations.count == 1,
+              "只展示实际引用且存在的候选资料")
+        check(resolvedCitation.answer == "根据教材[资料 1]，另见",
+              "虚构引用编号被清除")
+        let repeatedCitation = subjectRetrieval.resolvingCitations(
+            in: "📚[资料 0]依据[资料 1]与[资料1]，错误[资料 999999999999999999999999999999]结束")
+        check(repeatedCitation.answer == "📚依据[资料 1]与[资料1]，错误结束"
+              && repeatedCitation.citations.map(\.promptIndex) == [1],
+              "中文与 emoji 不破坏引用定位，重复引用去重，零与溢出编号清除")
+        let uncitedAnswer = subjectRetrieval.resolvingCitations(in: "没有引用的普通回答 📖")
+        check(uncitedAnswer.answer == "没有引用的普通回答 📖" && uncitedAnswer.citations.isEmpty,
+              "无引用回答保留原文，不附加候选资料")
+        check(StudyContextRetriever.retrieve(query: "量子隐形传态", snapshot: subjectSnapshot).items.isEmpty,
+              "无依据问题不生成资料引用")
+        check(StudyContextRetriever.retrieve(query: "勾股定理", snapshot: subjectSnapshot,
+                                             maxContextCharacters: 300).promptContext.count <= 300,
+              "检索结果受总字符预算约束")
         let citationMessage = ChatHistoryMessage(role: .assistant, content: "根据你的资料，先做 C 语言。[资料 1]", citations: Array(planningCitations.prefix(2)))
         let citationData = try! JSONEncoder().encode(citationMessage)
         let decodedCitationMessage = try! JSONDecoder().decode(ChatHistoryMessage.self, from: citationData)

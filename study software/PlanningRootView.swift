@@ -184,18 +184,18 @@ struct PlanningRootView: View {
                     Button {
                         Task {
                             isReevaluatingPlan = true
-                            await store.reevaluateTodayPlan(reason: .firstEntryWithoutPlan, announcesResult: true)
+                            await store.regenerateTodayPlan(force: true)
                             isReevaluatingPlan = false
                         }
                     } label: {
                         StudyActionPillLabel(
-                            title: isReevaluatingPlan ? "正在重新评估…" : (store.todayPlan == nil ? "生成今日计划" : "重新评估计划"),
+                            title: isReevaluatingPlan ? "正在重新规划…" : (store.todayPlan == nil ? "生成今日计划" : "重新规划今日计划"),
                             systemImage: "arrow.triangle.2.circlepath"
                         )
                     }
                     .buttonStyle(StudyActionPillButtonStyle(tint: StudyDesign.Colors.success, prominence: .primary, size: .compact))
                     .disabled(isReevaluatingPlan)
-                    .accessibilityHint("按当前课表、作息、预算和精力重新计算今天的安排")
+                    .accessibilityHint("使用最新学习记录、课表、作息和预算重新计算今天的安排")
 
                     Button {
                         isShowingFullPlan = true

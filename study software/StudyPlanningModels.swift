@@ -577,6 +577,8 @@ struct DailyPlanItem: Identifiable, Codable, Hashable, Sendable {
     /// 减量后的保底范围；`nil` 表示这条任务不可减量。
     var minimumScope: StudyScope?
     var estimatedMinutes: Int
+    /// 生成该计划版本时采用的历史校准说明；旧计划为空。
+    var durationEstimateExplanation: String?
     /// 实际安排时间（与到期日期无关）。
     var scheduledStart: Date?
     var scheduledEnd: Date?
@@ -607,6 +609,7 @@ struct DailyPlanItem: Identifiable, Codable, Hashable, Sendable {
         plannedScope: StudyScope,
         minimumScope: StudyScope? = nil,
         estimatedMinutes: Int,
+        durationEstimateExplanation: String? = nil,
         scheduledStart: Date? = nil,
         scheduledEnd: Date? = nil,
         scheduledDayKey: StudyDayKey,
@@ -629,6 +632,7 @@ struct DailyPlanItem: Identifiable, Codable, Hashable, Sendable {
         self.plannedScope = plannedScope
         self.minimumScope = minimumScope
         self.estimatedMinutes = max(0, estimatedMinutes)
+        self.durationEstimateExplanation = durationEstimateExplanation
         self.scheduledStart = scheduledStart
         self.scheduledEnd = scheduledEnd
         self.scheduledDayKey = scheduledDayKey
@@ -673,6 +677,7 @@ struct DailyPlanItem: Identifiable, Codable, Hashable, Sendable {
         plannedScope = try container.decodeIfPresent(StudyScope.self, forKey: .plannedScope) ?? .zero
         minimumScope = try container.decodeIfPresent(StudyScope.self, forKey: .minimumScope)
         estimatedMinutes = max(0, try container.decodeIfPresent(Int.self, forKey: .estimatedMinutes) ?? 0)
+        durationEstimateExplanation = try container.decodeIfPresent(String.self, forKey: .durationEstimateExplanation)
         scheduledStart = try container.decodeIfPresent(Date.self, forKey: .scheduledStart)
         scheduledEnd = try container.decodeIfPresent(Date.self, forKey: .scheduledEnd)
         scheduledDayKey = try container.decodeIfPresent(StudyDayKey.self, forKey: .scheduledDayKey)
@@ -887,6 +892,8 @@ struct DailyStudyPlan: Identifiable, Codable, Hashable, Sendable {
     var unplaceable: [UnplaceablePlanItem]
     /// 输入指纹：计划生成时的输入摘要。指纹相同表示"重复生成，无需重建"。
     var inputFingerprint: String
+    /// 非手动重规划沿用这个截点，避免新记录在页面刷新时改写既有估计。
+    var durationCalibrationCutoff: Date?
     var supersedesPlanID: UUID?
     /// 这个版本是否由一次可撤销的减量操作产生。
     var isUndoableReduction: Bool
@@ -908,6 +915,7 @@ struct DailyStudyPlan: Identifiable, Codable, Hashable, Sendable {
         items: [DailyPlanItem] = [],
         unplaceable: [UnplaceablePlanItem] = [],
         inputFingerprint: String = "",
+        durationCalibrationCutoff: Date? = nil,
         supersedesPlanID: UUID? = nil,
         isUndoableReduction: Bool = false,
         reductionUndoTargetPlanID: UUID? = nil,
@@ -925,6 +933,7 @@ struct DailyStudyPlan: Identifiable, Codable, Hashable, Sendable {
         self.items = items
         self.unplaceable = unplaceable
         self.inputFingerprint = inputFingerprint
+        self.durationCalibrationCutoff = durationCalibrationCutoff
         self.supersedesPlanID = supersedesPlanID
         self.isUndoableReduction = isUndoableReduction
         self.reductionUndoTargetPlanID = reductionUndoTargetPlanID
@@ -1009,6 +1018,7 @@ struct DailyStudyPlan: Identifiable, Codable, Hashable, Sendable {
         items = try container.decodeIfPresent([DailyPlanItem].self, forKey: .items) ?? []
         unplaceable = try container.decodeIfPresent([UnplaceablePlanItem].self, forKey: .unplaceable) ?? []
         inputFingerprint = try container.decodeIfPresent(String.self, forKey: .inputFingerprint) ?? ""
+        durationCalibrationCutoff = try container.decodeIfPresent(Date.self, forKey: .durationCalibrationCutoff)
         supersedesPlanID = try container.decodeIfPresent(UUID.self, forKey: .supersedesPlanID)
         isUndoableReduction = try container.decodeIfPresent(Bool.self, forKey: .isUndoableReduction) ?? false
         reductionUndoTargetPlanID = try container.decodeIfPresent(UUID.self, forKey: .reductionUndoTargetPlanID)

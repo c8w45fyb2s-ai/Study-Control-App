@@ -172,6 +172,9 @@ struct DailyPlanRequest {
     var completions: [CompletionEvent]
     /// 输入指纹：指纹相同 → 重复生成，引擎应当复用已有计划。
     var inputFingerprint: String
+    /// 自动调整沿用原计划截点；用户主动重规划才使用当前最新记录。
+    var durationCalibrationCutoff: Date?
+    var forceReplan: Bool
 
     init(
         dayKey: StudyDayKey,
@@ -181,7 +184,9 @@ struct DailyPlanRequest {
         candidates: [PlanCandidate],
         existingPlans: [DailyStudyPlan] = [],
         completions: [CompletionEvent] = [],
-        inputFingerprint: String = ""
+        inputFingerprint: String = "",
+        durationCalibrationCutoff: Date? = nil,
+        forceReplan: Bool = false
     ) {
         self.dayKey = dayKey
         self.context = context
@@ -191,6 +196,8 @@ struct DailyPlanRequest {
         self.existingPlans = existingPlans
         self.completions = completions
         self.inputFingerprint = inputFingerprint
+        self.durationCalibrationCutoff = durationCalibrationCutoff
+        self.forceReplan = forceReplan
     }
 
     /// 当天已生效的计划（同一天只应有一个 active）。

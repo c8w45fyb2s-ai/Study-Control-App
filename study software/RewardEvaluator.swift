@@ -69,16 +69,6 @@ extension EntertainmentTargetBinding {
 ///
 /// 用途：同一规则、同一学习日、同一档位只发放一次。仅仅切换启用状态、
 /// 或只改了展示文案的编辑，不会凭空多出一次发放。
-enum RewardGrantSemantics {
-    static func matches(_ snapshot: EntertainmentRuleSnapshot, _ rule: EntertainmentRule) -> Bool {
-        snapshot.ruleID == rule.id
-            && snapshot.condition.metric == rule.condition.metric
-            && snapshot.condition.requiredValue == rule.condition.requiredValue
-            && snapshot.fallback == rule.fallback
-            && snapshot.rewardMinutes == rule.rewardMinutes
-            && (snapshot.targets ?? []) == rule.boundTargets
-    }
-}
 
 // MARK: - 评估器
 

@@ -328,12 +328,6 @@ struct ImportView: View {
         return nil
     }
 
-    private var shouldShowImportStatusBanner: Bool {
-        if store.isBusy { return true }
-        let message = store.statusMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !message.isEmpty && message != "准备就绪"
-    }
-
     private var shouldShowIOSLibraryBulkBar: Bool {
         selectedImportSection == .library && !selectedDocuments.isEmpty
     }
@@ -515,6 +509,14 @@ struct ImportView: View {
         }
     }
 
+#endif
+
+    private var shouldShowImportStatusBanner: Bool {
+        if store.isBusy { return true }
+        let message = store.statusMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !message.isEmpty && message != "准备就绪"
+    }
+
     private var importStatusBanner: some View {
         HStack(alignment: .top, spacing: StudyDesign.Spacing.tight) {
             if store.isBusy {
@@ -537,8 +539,8 @@ struct ImportView: View {
                     StudyActionPillLabel(title: "取消", systemImage: "xmark")
                 }
                 .buttonStyle(StudyActionPillButtonStyle(tint: StudyDesign.Colors.danger, prominence: .soft, size: .compact, minWidth: 74))
-                .help("取消当前 AI 请求")
-                .accessibilityLabel("取消当前 AI 请求")
+                .help("取消当前资料处理")
+                .accessibilityLabel("取消当前资料处理")
                 .accessibilityHint("停止当前资料处理")
             }
         }
@@ -555,6 +557,7 @@ struct ImportView: View {
         .accessibilityValue(store.statusMessage.isEmpty ? "正在处理资料" : store.statusMessage)
     }
 
+#if os(iOS)
     private struct IOSImportNextStepCard: View {
         let step: IOSImportNextStep
 
@@ -641,6 +644,8 @@ struct ImportView: View {
             )
 
             ImportProcessView(currentStep: currentImportStep)
+
+            if shouldShowImportStatusBanner { importStatusBanner }
 
             // ── Drop zone ──────────────────────────────────
             dropZone
@@ -1286,12 +1291,12 @@ struct FileImportReviewCard: View {
         Button {
             onAnalyze()
         } label: {
-            StudyActionPillLabel(title: "开始分析", systemImage: "sparkles")
+            StudyActionPillLabel(title: "导入资料", systemImage: "square.and.arrow.down")
         }
         .buttonStyle(StudyActionPillButtonStyle(tint: importKind.libraryTint, minWidth: 100))
         .disabled(isBusy)
-        .help(isBusy ? "当前正在处理资料，完成后再开始分析。" : "开始分析这份资料")
-        .accessibilityHint(isBusy ? "当前正在处理资料，完成后再开始分析。" : "将所选资料发送到当前 AI 服务进行分析")
+        .help(isBusy ? "当前正在处理资料" : "逐页提取并本地保存；AI 可用时再生成待确认草稿")
+        .accessibilityHint(isBusy ? "当前正在处理资料" : "逐页提取并保存，AI 可选")
     }
 }
 
@@ -1492,6 +1497,7 @@ struct ImportedDocumentRow: View {
                             HStack(spacing: StudyDesign.Spacing.tight) {
                                 Label(document.importedAt.formatted(date: .abbreviated, time: .shortened), systemImage: "clock")
                                 Label("\(document.content.count) 字", systemImage: "text.alignleft")
+                                if !document.pages.isEmpty { Label("\(document.pages.count) 页", systemImage: "doc") }
                             }
                             .font(.caption2)
                             .foregroundStyle(StudyDesign.Colors.labelSecondary)
@@ -2140,6 +2146,9 @@ private struct MacDocumentPreviewPanel: View {
             HStack(spacing: StudyDesign.Spacing.tight) {
                 MacDocumentMetricTile(title: "类型", value: document.kind.libraryShortLabel, icon: document.kind.libraryIcon, tint: document.kind.libraryTint)
                 MacDocumentMetricTile(title: "正文", value: "\(document.content.count) 字", icon: "text.quote", tint: StudyDesign.Colors.info)
+                if !document.pages.isEmpty {
+                    MacDocumentMetricTile(title: "PDF 页面", value: "\(document.pages.count) 页 · OCR \(document.pages.filter { $0.method == .ocr && $0.state == .succeeded }.count) 页", icon: "doc", tint: StudyDesign.Colors.secondary)
+                }
             }
 
             ScrollView {

@@ -250,42 +250,6 @@ struct StudyHomeProgressBar: View {
 // MARK: - 反馈
 
 /// 首页唯一的反馈浮层内容（同一时刻只允许一个）。
-struct StudyHomeFeedbackOverlay: View {
-    var title: String
-    var message: String
-    var systemImage: String
-    var tint: Color
-
-    var body: some View {
-        HStack(alignment: .top, spacing: StudyDesign.Spacing.normal) {
-            Image(systemName: systemImage)
-                .font(.title3.weight(.bold))
-                .foregroundStyle(tint)
-                .accessibilityHidden(true)
-
-            VStack(alignment: .leading, spacing: StudyDesign.Spacing.micro) {
-                Text(title)
-                    .font(StudyDesign.Typography.cardTitle)
-                    .foregroundStyle(StudyDesign.Colors.labelPrimary)
-                Text(message)
-                    .font(StudyDesign.Typography.supporting)
-                    .foregroundStyle(StudyDesign.Colors.labelSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Spacer(minLength: 0)
-        }
-        .padding(StudyDesign.Spacing.roomy)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(StudyDesign.Colors.elevatedBackground, in: RoundedRectangle(cornerRadius: StudyDesign.Radius.large, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: StudyDesign.Radius.large, style: .continuous)
-                .stroke(tint.opacity(0.32), lineWidth: 1)
-        )
-        .shadow(color: StudyDesign.Shadow.elevated.color, radius: StudyDesign.Shadow.elevated.radius, y: StudyDesign.Shadow.elevated.y)
-        .accessibilityElement(children: .combine)
-    }
-}
 
 // MARK: - 一级入口列表行
 

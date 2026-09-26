@@ -300,18 +300,6 @@ final class AppStore: ObservableObject {
         statusMessage = "已取消当前 AI 请求"
     }
 
-    func estimatedInputTokens(for text: String) -> Int {
-        max(1, Int((Double(text.count) / 3.2).rounded(.up)))
-    }
-
-    func estimatedAnalysisTokenText(for documents: [StudyDocument]) -> String {
-        let chunkSize = max(snapshot.settings.maxAnalysisChunkCharacters, 2_000)
-        let chunkCount = documents.reduce(0) { partial, document in
-            partial + max(1, Int(ceil(Double(document.content.count) / Double(chunkSize))))
-        }
-        return chunkCount <= documents.count ? "\(documents.count) 份资料待分析" : "\(documents.count) 份资料较长，将分段分析"
-    }
-
     // MARK: - Editing
 
     func updateKnowledgePoint(_ point: KnowledgePoint, title: String, subject: String, summary: String, mastery: Double) {
@@ -366,7 +354,8 @@ final class AppStore: ObservableObject {
         answerMode: AIAnswerMode,
         maxAnalysisChunkCharacters: Int,
         inputTokenCostPerMillion: Double,
-        outputTokenCostPerMillion: Double
+        outputTokenCostPerMillion: Double,
+        keepOriginalPDF: Bool? = nil
     ) -> Bool {
         let oldRemindersEnabled = snapshot.settings.remindersEnabled
         var candidate = snapshot
@@ -386,6 +375,14 @@ final class AppStore: ObservableObject {
         candidate.settings.allowStructuredPlanRequests = allowStructuredPlanRequests
         candidate.settings.includePersonalContextInAnswers = includePersonalContextInAnswers
         candidate.settings.keepDocumentContent = keepDocumentContent
+        candidate.settings.keepOriginalPDF = keepOriginalPDF ?? snapshot.settings.keepOriginalPDF
+        let removedPDFNames: [String]
+        if snapshot.settings.keepOriginalPDF && !candidate.settings.keepOriginalPDF {
+            removedPDFNames = candidate.documents.compactMap(\.originalPDFFileName)
+            for index in candidate.documents.indices { candidate.documents[index].originalPDFFileName = nil }
+        } else {
+            removedPDFNames = []
+        }
         candidate.settings.answerMode = answerMode
         candidate.settings.maxAnalysisChunkCharacters = min(max(maxAnalysisChunkCharacters, 2_000), 24_000)
         candidate.settings.inputTokenCostPerMillion = max(inputTokenCostPerMillion, 0)
@@ -455,6 +452,7 @@ final class AppStore: ObservableObject {
 
         // 只有 Keychain 与快照都成功后，才一起发布新的运行时连接状态。
         snapshot = normalizedCandidate
+        for name in removedPDFNames { removeManagedPDF(named: name) }
         self.apiKey = apiKey
         settingsDraftAPIKey = apiKey
         activeCredentialScope = connection.credentialScope
@@ -1106,8 +1104,8 @@ final class AppStore: ObservableObject {
     }
 
     func importAndAnalyze(url: URL, kind: DocumentKind) {
-        startAIRequest("正在导入并分析...") {
-            await self.runBusy("正在导入并分析...") { [self] in
+        startAIRequest("正在导入资料...") {
+            await self.runBusy("正在导入资料...") { [self] in
                 let isAccessing = url.startAccessingSecurityScopedResource()
                 defer {
                     if isAccessing {
@@ -1115,19 +1113,72 @@ final class AppStore: ObservableObject {
                     }
                 }
 
-                let content = try await DocumentProcessor.readContent(from: url)
-                let document = StudyDocument(
+                let documentID = UUID()
+                let extracted = try await DocumentProcessor.readStructuredContent(from: url, documentID: documentID) { completed, total in
+                    self.statusMessage = "正在处理 PDF 页面 \(completed)/\(total)"
+                }
+                try Task.checkCancellation()
+                var document = StudyDocument(
+                    id: documentID,
                     title: url.deletingPathExtension().lastPathComponent,
                     sourceName: url.lastPathComponent,
                     kind: kind,
-                    content: snapshot.settings.keepDocumentContent ? content : "已根据隐私设置不保存导入原文。"
+                    content: snapshot.settings.keepDocumentContent ? extracted.content : "已根据隐私设置不保存导入原文。"
                 )
+                if snapshot.settings.keepDocumentContent {
+                    document.pages = extracted.pages
+                    document.chunks = DocumentChunkBuilder.build(documentID: documentID,
+                        content: extracted.content, pages: extracted.pages)
+                } else {
+                    document.pages = extracted.pages.map { page in
+                        var stripped = page
+                        stripped.text = ""
+                        stripped.failureReason = nil
+                        return stripped
+                    }
+                }
+                if url.pathExtension.lowercased() == "pdf", snapshot.settings.keepOriginalPDF {
+                    document.originalPDFFileName = try copyPDFIntoManagedStorage(from: url, documentID: documentID)
+                }
                 snapshot.documents.insert(document, at: 0)
-                save()
-
-                try await analyzeAndStoreDraft(for: document, content: content, kind: kind)
+                guard save() else {
+                    if let name = document.originalPDFFileName { removeManagedPDF(named: name) }
+                    return
+                }
+                guard snapshot.settings.allowModelRequests && isAIConnectionReady else {
+                    statusMessage = "资料已本地导入；AI 未启用，稍后可手动分析"
+                    return
+                }
+                try Task.checkCancellation()
+                try await analyzeAndStoreDraft(for: document, content: extracted.content, kind: kind)
             }
         }
+    }
+
+    private func managedPDFURL(named name: String) -> URL? {
+        guard name == URL(fileURLWithPath: name).lastPathComponent,
+              name.hasSuffix(".pdf") else { return nil }
+        return environment.storeLocation.directory.appendingPathComponent("Attachments", isDirectory: true)
+            .appendingPathComponent(name)
+    }
+
+    func originalPDFURL(for document: StudyDocument) -> URL? {
+        guard let name = document.originalPDFFileName,
+              let url = managedPDFURL(named: name), FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return url
+    }
+
+    private func copyPDFIntoManagedStorage(from source: URL, documentID: UUID) throws -> String {
+        let name = "\(documentID.uuidString).pdf"
+        guard let destination = managedPDFURL(named: name) else { throw DocumentProcessor.ProcessingError.unsupportedFile }
+        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: source, to: destination)
+        return name
+    }
+
+    private func removeManagedPDF(named name: String) {
+        guard let url = managedPDFURL(named: name) else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     @discardableResult
@@ -1135,7 +1186,10 @@ final class AppStore: ObservableObject {
         guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         let storedContent = snapshot.settings.keepDocumentContent ? content : "已根据隐私设置不保存手动输入原文。"
-        let document = StudyDocument(title: title, sourceName: "手动输入", kind: kind, content: storedContent)
+        var document = StudyDocument(title: title, sourceName: "手动输入", kind: kind, content: storedContent)
+        if snapshot.settings.keepDocumentContent {
+            document.chunks = DocumentChunkBuilder.build(documentID: document.id, content: content, pages: [])
+        }
         snapshot.documents.insert(document, at: 0)
         guard save() else { return nil }
         statusMessage = "资料已保存"
@@ -1182,6 +1236,7 @@ final class AppStore: ObservableObject {
 
     @discardableResult
     func confirmDraft(_ draft: AnalysisDraft) -> DraftConfirmationResult {
+        let sourceDocument = snapshot.documents.first { $0.id == draft.sourceDocumentID }
         var titleToID: [String: UUID] = Dictionary(uniqueKeysWithValues: snapshot.knowledgePoints.map { ($0.title, $0.id) })
         var createdKnowledgePointIDs: [UUID] = []
 
@@ -1190,8 +1245,18 @@ final class AppStore: ObservableObject {
                let index = snapshot.knowledgePoints.firstIndex(where: { $0.id == existingID }) {
                 snapshot.knowledgePoints[index].summary = item.summary
                 snapshot.knowledgePoints[index].mastery = min(snapshot.knowledgePoints[index].mastery, item.mastery)
+                if snapshot.knowledgePoints[index].sourceDocumentID == nil {
+                    snapshot.knowledgePoints[index].sourceDocumentID = draft.sourceDocumentID
+                }
+                if snapshot.knowledgePoints[index].sourceReference == nil, let sourceDocument {
+                    snapshot.knowledgePoints[index].sourceReference = DocumentChunkBuilder.reference(in: sourceDocument, matching: item.title)
+                }
             } else {
-                let point = KnowledgePoint(title: item.title, subject: item.subject, summary: item.summary, mastery: item.mastery)
+                var point = KnowledgePoint(title: item.title, subject: item.subject, summary: item.summary, mastery: item.mastery)
+                point.sourceDocumentID = draft.sourceDocumentID
+                if let sourceDocument {
+                    point.sourceReference = DocumentChunkBuilder.reference(in: sourceDocument, matching: item.title)
+                }
                 snapshot.knowledgePoints.insert(point, at: 0)
                 titleToID[item.title] = point.id
                 createdKnowledgePointIDs.append(point.id)
@@ -1202,7 +1267,7 @@ final class AppStore: ObservableObject {
         let mistakes = draft.mistakes.map { item in
             let id = UUID()
             mistakeIDsByDraftID[item.id] = id
-            return Mistake(
+            var mistake = Mistake(
                 id: id,
                 question: item.question,
                 correctAnswer: item.correctAnswer,
@@ -1210,6 +1275,10 @@ final class AppStore: ObservableObject {
                 sourceDocumentID: draft.sourceDocumentID,
                 knowledgePointIDs: item.relatedKnowledgeTitles.compactMap { titleToID[$0] }
             )
+            if let sourceDocument {
+                mistake.sourceReference = DocumentChunkBuilder.reference(in: sourceDocument, matching: item.question)
+            }
+            return mistake
         }
         snapshot.mistakes.insert(contentsOf: mistakes, at: 0)
 
@@ -1250,6 +1319,7 @@ final class AppStore: ObservableObject {
     }
 
     func deleteDocument(_ document: StudyDocument) {
+        let attachmentName = document.originalPDFFileName
         let linkedMistakeIDs = Set(snapshot.mistakes
             .filter { $0.sourceDocumentID == document.id }
             .map(\.id))
@@ -1269,6 +1339,7 @@ final class AppStore: ObservableObject {
         }
 
         guard saveWithRewardReevaluation() else { return }
+        if let attachmentName { removeManagedPDF(named: attachmentName) }
         requestReminderSync()
         statusMessage = "已删除资料：\(document.title)"
         recordEvent(.info, "删除资料：\(document.title)")
@@ -1473,7 +1544,7 @@ final class AppStore: ObservableObject {
         }
     }
 
-    func importBackup(url: URL) {
+    func importBackup(url: URL, mode: BackupImportMode = .replace) {
         do {
             let didAccess = url.startAccessingSecurityScopedResource()
             defer {
@@ -1483,13 +1554,52 @@ final class AppStore: ObservableObject {
             }
             guard var imported = try persistence?.importSnapshot(from: url) else { return }
             imported = imported.normalizedToCurrentSchema()
-            imported.settings.legacyCredentialMigrationPending = false
-            imported.diagnosticEvents.insert(AppDiagnosticEvent(level: .info, message: "从备份导入数据"), at: 0)
             Task {
-                let saved = await commit(imported, status: "已导入备份", reminderChanges: [], now: Date())
+                var candidate: StoreSnapshot
+                var mergeReport: SnapshotMergeService.Report?
+                if mode == .merge {
+                    do {
+                        let merged = try SnapshotMergeService.merge(local: snapshot, incoming: imported)
+                        mergeReport = merged.report
+                        guard merged.report.didChange else {
+                            statusMessage = "合并导入未新增记录；\(merged.report.summary)"
+                            return
+                        }
+                        candidate = merged.snapshot
+                    } catch {
+                        statusMessage = "合并备份失败：\(error.localizedDescription)"
+                        return
+                    }
+                } else {
+                    candidate = imported
+                }
+                candidate.settings.legacyCredentialMigrationPending = false
+                candidate.diagnosticEvents.insert(AppDiagnosticEvent(level: .info,
+                    message: mode == .merge ? "手动合并备份：\(mergeReport?.summary ?? "")" : "从备份导入数据"), at: 0)
+                let createdAttachmentNames: [String]
+                do {
+                    let existingDocumentIDs: Set<UUID> = mode == .merge ? Set(snapshot.documents.map(\.id)) : []
+                    createdAttachmentNames = try restoreBackupAttachments(in: &candidate,
+                        preservingDocumentIDs: existingDocumentIDs)
+                } catch {
+                    statusMessage = "备份附件恢复失败：\(error.localizedDescription)"
+                    return
+                }
+                var reminderChanges: [ReminderChangeRequest] = []
+                if mode == .merge {
+                    let context = candidate.planningContext(now: Date())
+                    let refreshed = coordinator.coordinate(.refresh(dayKey: context.todayKey),
+                        state: candidate, context: context)
+                    candidate = refreshed.snapshot
+                    reminderChanges = refreshed.reminderChanges
+                }
+                let saved = await commit(candidate,
+                    status: mode == .merge ? "已合并备份；\(mergeReport?.summary ?? "")" : "已导入备份",
+                    reminderChanges: reminderChanges, now: Date())
+                if !saved { for name in createdAttachmentNames { removeManagedPDF(named: name) } }
                 if saved {
                     await synchronizeReminders(now: Date())
-                    // 导入会整体替换数据：必须按新数据重新评估今天的计划。
+                    // 导入后按合并或替换后的快照重新评估今天的计划。
                     await reevaluateTodayPlan(reason: .dataRestored, now: Date())
                 }
             }
@@ -1512,6 +1622,11 @@ final class AppStore: ObservableObject {
                 AppDiagnosticEvent(level: .warning, message: "从备份 #\(index) (\(label)) 还原数据"),
                 at: 0
             )
+            for index in recovered.documents.indices where recovered.documents[index].originalPDFFileName != nil {
+                if originalPDFURL(for: recovered.documents[index]) == nil {
+                    recovered.documents[index].originalPDFFileName = nil
+                }
+            }
             Task {
                 let saved = await commit(recovered, status: "已从备份 #\(index) (\(label)) 恢复", reminderChanges: [], now: Date())
                 if saved {
@@ -1524,17 +1639,6 @@ final class AppStore: ObservableObject {
             statusMessage = "恢复失败：\(error.localizedDescription)"
             recordEvent(.error, "恢复备份 #\(index) 失败：\(error.localizedDescription)")
         }
-    }
-
-    func restoreRecoverySnapshot() {
-        let backups = availableBackups
-        guard let first = backups.first else {
-            statusMessage = "没有可用的恢复点"
-            recordEvent(.warning, "尝试恢复，但没有可用恢复点")
-            return
-        }
-        let label = first.date.formatted(date: .abbreviated, time: .shortened)
-        restoreFromBackup(index: first.index, label: label)
     }
 
     func resetUsageStats() {
@@ -1562,27 +1666,63 @@ final class AppStore: ObservableObject {
         }
     }
 
-    func makeBackupDocument() -> ExportDocument {
+    func makeBackupDocument() throws -> ExportDocument {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         // 备份必须写成当前 schema；写入方不做降级，避免导入时被迫走错误的迁移路径。
-        let exportSnapshot = snapshot.normalizedToCurrentSchema()
-        let data = (try? encoder.encode(exportSnapshot)) ?? Data()
+        var exportSnapshot = snapshot.normalizedToCurrentSchema()
+        for index in exportSnapshot.documents.indices {
+            if let url = originalPDFURL(for: exportSnapshot.documents[index]) {
+                exportSnapshot.documents[index].backupPDFData = try Data(contentsOf: url)
+            } else {
+                exportSnapshot.documents[index].originalPDFFileName = nil
+            }
+        }
+        let data = try encoder.encode(exportSnapshot)
         return ExportDocument(data: data)
     }
 
-    func makePrivacyBackupDocument() -> ExportDocument {
+    func makePrivacyBackupDocument() throws -> ExportDocument {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        var exportSnapshot = snapshot.normalizedToCurrentSchema()
-        exportSnapshot.diagnosticEvents = []
-        exportSnapshot.documents = exportSnapshot.documents.map { document in
-            var redacted = document
-            redacted.content = "隐私导出已省略原文内容。"
-            return redacted
-        }
-        let data = (try? encoder.encode(exportSnapshot)) ?? Data()
+        let exportSnapshot = SnapshotPrivacyRedactor.redact(snapshot.normalizedToCurrentSchema()).snapshot
+        let data = try encoder.encode(exportSnapshot)
         return ExportDocument(data: data)
+    }
+
+    private func restoreBackupAttachments(in snapshot: inout StoreSnapshot,
+                                          preservingDocumentIDs: Set<UUID> = []) throws -> [String] {
+        var createdNames: [String] = []
+        do {
+            for index in snapshot.documents.indices {
+                let documentID = snapshot.documents[index].id
+                guard let data = snapshot.documents[index].backupPDFData else {
+                    if !preservingDocumentIDs.contains(documentID)
+                        || snapshot.documents[index].originalPDFFileName.flatMap({ managedPDFURL(named: $0) })
+                            .map({ FileManager.default.fileExists(atPath: $0.path) }) != true {
+                        snapshot.documents[index].originalPDFFileName = nil
+                    }
+                    continue
+                }
+                // 历史本地快照可能仍引用旧附件；冲突时另存，避免把旧快照指向新内容。
+                let preferredName = "\(documentID.uuidString).pdf"
+                let preferredURL = managedPDFURL(named: preferredName)
+                let name = preferredURL.map { FileManager.default.fileExists(atPath: $0.path) } == true
+                    ? "\(documentID.uuidString)-\(UUID().uuidString).pdf" : preferredName
+                guard let destination = managedPDFURL(named: name) else {
+                    throw DocumentProcessor.ProcessingError.unsupportedFile
+                }
+                try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try data.write(to: destination, options: .atomic)
+                createdNames.append(name)
+                snapshot.documents[index].originalPDFFileName = name
+                snapshot.documents[index].backupPDFData = nil
+            }
+        } catch {
+            for name in createdNames { removeManagedPDF(named: name) }
+            throw error
+        }
+        return createdNames
     }
 
     func makeMarkdownExportDocument() -> ExportDocument {
@@ -1657,8 +1797,12 @@ final class AppStore: ObservableObject {
                 recordUsage(result.usage, pricing: client.pricing)
                 let contextCharCount = shouldUseContext ? retrieval.promptContext.count : 0
                 let truncatedNote = contextCharCount > 30_000 ? "\n\n（部分个人资料因长度限制已截断）" : ""
-                let citations = shouldUseContext ? retrieval.citations : []
-                let answerText = result.answer + makeCitationTail(from: citations) + truncatedNote
+                let resolved = shouldUseContext
+                    ? retrieval.resolvingCitations(in: result.answer) : (answer: result.answer, citations: [])
+                let citations = resolved.citations
+                let noEvidenceNote = shouldUseContext && retrieval.items.isEmpty
+                    ? "\n\n未检索到直接证据；以上是通用解释。" : ""
+                let answerText = resolved.answer + noEvidenceNote + makeCitationTail(from: citations) + truncatedNote
                 chatAnswer = answerText
                 var assistantMessage = ChatHistoryMessage(role: .assistant, content: answerText, citations: citations)
 
@@ -1683,10 +1827,10 @@ final class AppStore: ObservableObject {
                 let hasPlanDraft = assistantMessage.aiPlanDraftID != nil
                 if hasPlanDraft {
                     statusMessage = shouldUseContext && !retrieval.items.isEmpty
-                        ? "答疑完成：引用 \(retrieval.items.count) 条个人资料，并生成待确认规划草稿"
+                        ? "答疑完成：实际引用 \(citations.count) 条资料，并生成待确认规划草稿"
                         : "答疑完成：已生成待确认规划草稿"
                 } else {
-                    statusMessage = shouldUseContext && !retrieval.items.isEmpty ? "答疑完成：引用 \(retrieval.items.count) 条个人资料" : "答疑完成"
+                    statusMessage = shouldUseContext && !retrieval.items.isEmpty ? "答疑完成：实际引用 \(citations.count) 条资料" : "答疑完成"
                 }
             }
         }
@@ -3426,11 +3570,6 @@ final class AppStore: ObservableObject {
         Task { await completeReview(task, quality: quality) }
     }
 
-    /// 兼容入口：与 `rateReview(.good)` 等价。
-    func markDone(_ task: ReviewTask) {
-        rateReview(task, quality: .good)
-    }
-
     /// 完成一次复习（可直接 await，便于测试与明确的成功/失败处理）。
     @discardableResult
     func completeReview(
@@ -3455,7 +3594,7 @@ final class AppStore: ObservableObject {
             durationSource: .unrecorded,
             durationNote: "复习列表直接标记完成，未计时；预计 \(PlanCandidateBuilder.defaultReviewTaskMinutes) 分钟仅为安排用估算。",
             assessment: StudyAssessment(selfRating: quality.rawValue),
-            note: "",
+            note: "线下自评",
             state: snapshot,
             context: context,
             successMessage: "\(quality.shortLabel) — 已记录本次复习（未计时）"
@@ -3485,72 +3624,164 @@ final class AppStore: ObservableObject {
         return PlanActionOutcome(coordination: result, didPersist: true, isStorageAvailable: true, errorMessage: nil)
     }
 
-    /// 错题页：完成一次错题。
-    ///
-    /// 保留原有语义（这是用户可见的旧行为，不能改）：
-    /// - 关联的复习任务标记为已完成，并记录本次复习评分与时间；
-    /// - 该错题从错题列表移除；
-    /// - 取消这些任务的本地提醒，并记一次当日打卡。
-    ///
-    /// 新增强化：同一份动作还会写入统一的完成事件（可追溯、可撤销、可参与奖励评估）。
+    /// 订正只表示已经核对答案，不代表成功回忆，也不发完成奖励。
     func completeMistake(_ mistake: Mistake) {
-        Task { await performMistakeCompletion(mistake) }
+        guard let index = snapshot.mistakes.firstIndex(where: { $0.id == mistake.id }) else { return }
+        snapshot.mistakes[index].practiceState = .needsRetry
+        snapshot.mistakes[index].stateChangedAt = Date()
+        snapshot.mistakes[index].stateChangeSource = "用户订正"
+        guard save() else { return }
+        statusMessage = "已订正；请应用内重做，答对两天后自动归档"
     }
 
-    private func performMistakeCompletion(_ mistake: Mistake, now: Date = Date()) async {
+    func setMistakeArchived(_ mistake: Mistake, archived: Bool, now: Date = Date()) {
+        guard let index = snapshot.mistakes.firstIndex(where: { $0.id == mistake.id }) else { return }
+        snapshot.mistakes[index].practiceState = archived ? .mastered : .needsRetry
+        snapshot.mistakes[index].stateChangedAt = now
+        snapshot.mistakes[index].stateChangeSource = archived ? "用户手动归档" : "用户恢复"
+        guard save() else { return }
+        statusMessage = archived ? "已手动归档错题" : "已恢复错题，等待重做"
+    }
+
+    @discardableResult
+    func saveStudyCard(_ card: StudyCard, linkedReviewTaskID: UUID? = nil, now: Date = Date()) -> Bool {
+        guard let candidate = ActiveRecallLibrary.saving(card, linkedReviewTaskID: linkedReviewTaskID,
+                                                         in: snapshot, at: now) else {
+            statusMessage = "题面和答案不能为空"
+            return false
+        }
+        return persistAndPublish(candidate, status: "卡片已保存")
+    }
+
+    /// 题面与任务通过稳定卡片 ID 关联；旧任务可在首次练习时生成卡片。
+    func card(for task: ReviewTask) -> StudyCard? {
+        ActiveRecallLibrary.card(for: task, in: snapshot)
+    }
+
+    @discardableResult
+    func ensureCard(for task: ReviewTask) -> StudyCard? {
+        if let existing = card(for: task) { return existing }
+        guard let (candidate, card) = ActiveRecallLibrary.creatingCard(for: task, in: snapshot) else {
+            statusMessage = "请先为这项复习创建有答案的卡片"
+            return nil
+        }
+        guard persistAndPublish(candidate, status: "已建立练习卡片") else { return nil }
+        return card
+    }
+
+    @discardableResult
+    func createCard(from mistake: Mistake) -> StudyCard? {
+        guard let card = ActiveRecallLibrary.makeCard(mistake: mistake) else {
+            statusMessage = "请先填写题面和正确答案"; return nil
+        }
+        return saveStudyCard(card) ? card : nil
+    }
+
+    @discardableResult
+    func createCard(from point: KnowledgePoint) -> StudyCard? {
+        guard let card = ActiveRecallLibrary.makeCard(knowledgePoint: point) else {
+            statusMessage = "请先填写知识点标题和说明"; return nil
+        }
+        return saveStudyCard(card) ? card : nil
+    }
+
+    @discardableResult
+    func submitReviewAttempt(_ attempt: ReviewAttempt, now: Date = Date()) async -> Bool {
+        guard !snapshot.reviewAttempts.contains(where: { $0.id == attempt.id }),
+              attempt.revealedAnswer,
+              ReviewPlanner.Quality(rawValue: attempt.quality) != nil,
+              let card = snapshot.studyCards.first(where: { $0.id == attempt.cardID }),
+              let taskIndex = snapshot.reviewTasks.firstIndex(where: { $0.cardID == card.id }),
+              attempt.contentVersion == card.contentVersion else { return false }
+        let task = snapshot.reviewTasks[taskIndex]
         let context = snapshot.planningContext(now: now)
-        let dayKey = context.todayKey
-        let ratio = snapshot.availabilityPreferences.planning.minimumScopeRatio
-        let linkedTaskIDs = linkedReviewTaskIDs(for: mistake)
-
-        // 错题页同样是"直接完成、不计时"：时长为 0 且来源为未记录。
-        let result = coordinator.completeDirect(
-            key: StudyCompletionKey.mistake(mistake.id, dayKey: dayKey),
-            dayKey: dayKey,
-            source: DailyPlanItemSource(kind: .manual, manualNote: "错题练习：\(ReviewPlanner.shortTitle(mistake.question))"),
-            plannedScope: .tasks(1),
-            minimumScope: .tasks(ratio),
-            completedScope: .tasks(1),
-            minutes: 0,
-            durationSource: .unrecorded,
-            durationNote: "错题页直接标记完成，未计时。",
-            assessment: nil,
-            note: "错题练习",
-            state: snapshot,
-            context: context,
-            successMessage: "已完成错题：\(ReviewPlanner.shortTitle(mistake.question))"
-        )
-
-        if let rejection = result.rejection {
-            statusMessage = rejection.message
-            return
+        let key = StudyCompletionKey.reviewTask(task.id, dayKey: context.todayKey)
+        let alreadyCompletedToday = snapshot.completionEvents.contains { $0.idempotencyKey == key && !$0.isRevoked }
+            || snapshot.completionEvents.contains { $0.source?.reviewTaskID == task.id && $0.dayKey == context.todayKey && !$0.isRevoked }
+        var candidate = snapshot
+        var reminders: [ReminderChangeRequest] = []
+        var eventID: UUID?
+        let oldEventIDs = Set(snapshot.completionEvents.map(\.id))
+        if !alreadyCompletedToday {
+            let result = coordinator.completeDirect(key: key, dayKey: context.todayKey,
+                source: .reviewTask(task.id, knowledgePointID: task.knowledgePointID),
+                plannedScope: .tasks(1), completedScope: .tasks(1), minutes: 0,
+                durationSource: .unrecorded, durationNote: "应用内作答耗时单独记录；不充当计划学习分钟",
+                assessment: StudyAssessment(selfRating: attempt.quality), note: "应用内作答",
+                state: snapshot, context: context, successMessage: "已记录作答")
+            guard result.rejection == nil else { statusMessage = result.statusMessage; return false }
+            candidate = result.snapshot
+            reminders = result.reminderChanges
+            eventID = candidate.completionEvents.first { !oldEventIDs.contains($0.id) }?.id
+        } else if let index = candidate.reviewTasks.firstIndex(where: { $0.id == task.id }),
+                  let quality = ReviewPlanner.Quality(rawValue: attempt.quality) {
+            candidate.reviewTasks[index] = SM2ReviewScheduler().schedule(task: candidate.reviewTasks[index], quality: quality, context: context)
         }
-
-        // 原有可见语义：关联复习任务完成 + 错题出列。
-        var candidate = result.snapshot
-        for index in candidate.reviewTasks.indices where linkedTaskIDs.contains(candidate.reviewTasks[index].id) {
-            candidate.reviewTasks[index].status = .done
-            candidate.reviewTasks[index].lastQuality = ReviewPlanner.Quality.good.rawValue
-            candidate.reviewTasks[index].lastReviewedAt = now
+        var recorded = attempt
+        recorded.reviewTaskID = task.id
+        recorded.completionEventID = eventID
+        recorded.priorReviewTask = task
+        candidate.reviewAttempts.append(recorded)
+        if let mistakeID = card.mistakeID,
+           let index = candidate.mistakes.firstIndex(where: { $0.id == mistakeID }) {
+            candidate.mistakes[index].practiceState = ActiveRecallLibrary.practiceState(
+                for: mistakeID, in: candidate, timeZone: context.timeZone)
+            candidate.mistakes[index].stateChangedAt = now
+            candidate.mistakes[index].stateChangeSource = "应用内重做"
         }
-        candidate.mistakes.removeAll { $0.id == mistake.id }
+        if !alreadyCompletedToday { _ = Self.applyingDailyActivity(to: &candidate, at: now) }
+        let saved = await commit(candidate, status: "已保存作答；\(ReviewPlanner.Quality(rawValue: attempt.quality)!.label)", reminderChanges: reminders, now: now)
+        if saved { requestReminderSync() }
+        return saved
+    }
 
-        // 打卡与完成事件同一次提交（需求 9）。
-        let activity = Self.applyingDailyActivity(to: &candidate, at: now)
-        if activity.didCheckInToday {
-            checkInCelebrationTrigger += 1
+    /// 只撤销该任务最新的有效作答，避免覆盖后续调度。完成事件和奖励同次提交。
+    @discardableResult
+    func revokeReviewAttempt(_ attemptID: UUID, now: Date = Date()) async -> Bool {
+        if let attempt = snapshot.reviewAttempts.first(where: { $0.id == attemptID && $0.isActive }),
+           attempt.priorReviewTask == nil {
+            statusMessage = "这条导入作答没有可安全恢复的本机调度快照；请在来源设备处理后重新合并"
+            return false
         }
-
-        let saved = await commit(
-            candidate,
-            status: result.statusMessage + checkInStatusSuffix(for: activity),
-            reminderChanges: result.reminderChanges,
-            now: now
-        )
-        guard saved else { return }
-
-        requestReminderSync()
-        recordEvent(.info, "完成错题：\(ReviewPlanner.shortTitle(mistake.question))")
+        guard let attemptIndex = snapshot.reviewAttempts.firstIndex(where: { $0.id == attemptID && $0.isActive }),
+              let taskID = snapshot.reviewAttempts[attemptIndex].reviewTaskID,
+              snapshot.reviewAttempts.filter({ $0.reviewTaskID == taskID && $0.isActive })
+                .max(by: { $0.submittedAt < $1.submittedAt })?.id == attemptID,
+              let priorTask = snapshot.reviewAttempts[attemptIndex].priorReviewTask else { return false }
+        let attempt = snapshot.reviewAttempts[attemptIndex]
+        var candidate = snapshot
+        var reminders: [ReminderChangeRequest] = []
+        if let eventID = attempt.completionEventID {
+            let result = coordinator.coordinate(.revokeCompletion(completionID: eventID, reason: "撤销应用内作答"),
+                state: candidate, context: candidate.planningContext(now: now))
+            guard result.rejection == nil else { statusMessage = result.statusMessage; return false }
+            candidate = result.snapshot
+            reminders = result.reminderChanges
+            let dayString = DailyActivityRecord.dateString(from: attempt.submittedAt)
+            if let activityIndex = candidate.dailyActivityRecords.firstIndex(where: { $0.dateString == dayString }) {
+                candidate.dailyActivityRecords[activityIndex].completedTaskCount = max(0,
+                    candidate.dailyActivityRecords[activityIndex].completedTaskCount - 1)
+                if candidate.dailyActivityRecords[activityIndex].completedTaskCount == 0 {
+                    candidate.dailyActivityRecords.remove(at: activityIndex)
+                }
+            }
+        }
+        guard let index = candidate.reviewTasks.firstIndex(where: { $0.id == taskID }),
+              let refreshedIndex = candidate.reviewAttempts.firstIndex(where: { $0.id == attemptID }) else { return false }
+        candidate.reviewTasks[index] = priorTask
+        candidate.reviewAttempts[refreshedIndex].revokedAt = now
+        candidate.reviewAttempts[refreshedIndex].revocationReason = "用户撤销"
+        if let card = candidate.studyCards.first(where: { $0.id == attempt.cardID }),
+           let mistakeID = card.mistakeID,
+           let mistakeIndex = candidate.mistakes.firstIndex(where: { $0.id == mistakeID }) {
+            candidate.mistakes[mistakeIndex].practiceState = ActiveRecallLibrary.practiceState(
+                for: mistakeID, in: candidate, timeZone: candidate.planningContext(now: now).timeZone)
+            candidate.mistakes[mistakeIndex].stateChangedAt = now
+            candidate.mistakes[mistakeIndex].stateChangeSource = "撤销应用内作答"
+        }
+        let saved = await commit(candidate, status: "已撤销作答并恢复复习安排", reminderChanges: reminders, now: now)
+        if saved { requestReminderSync() }
+        return saved
     }
 
     func recordAIRefusalUsage(_ refusal: AIModelRefusal) {

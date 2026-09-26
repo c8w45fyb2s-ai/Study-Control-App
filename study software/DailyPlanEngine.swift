@@ -220,7 +220,7 @@ struct LocalDailyPlanEngine: DailyPlanEngine {
         let activePlan = request.activePlan
 
         // 0) 相同输入 → 复用，不新增重复计划项。
-        if configuration.reusesUnchangedPlan,
+        if configuration.reusesUnchangedPlan, !request.forceReplan,
            let activePlan,
            activePlan.hasSameInput(as: request.inputFingerprint) {
             return Self.reuseProposal(activePlan: activePlan)
@@ -312,11 +312,13 @@ struct LocalDailyPlanEngine: DailyPlanEngine {
             // 已经作为保护任务保留 → 不重复排入。
             if protectedSources.contains(ranked.candidate.candidate.source) { continue }
 
-            let minutes = durationEstimator.estimatedMinutes(
+            let durationEstimate = durationEstimator.estimate(
                 for: ranked.candidate,
                 risk: ranked.forgettingRisk,
-                preferences: preferences.planning
+                preferences: preferences.planning,
+                before: request.durationCalibrationCutoff ?? context.now
             )
+            let minutes = durationEstimate.minutes
             guard minutes > 0 else { continue }
 
             let earliest = Self.earliestStart(for: ranked, context: context)
@@ -386,6 +388,7 @@ struct LocalDailyPlanEngine: DailyPlanEngine {
                 planID: planID,
                 dayKey: dayKey,
                 minutes: minutes,
+                durationEstimateExplanation: durationEstimate.explanation,
                 placement: placement,
                 context: context,
                 existing: existing
@@ -513,6 +516,7 @@ struct LocalDailyPlanEngine: DailyPlanEngine {
             items: items,
             unplaceable: unplaceable,
             inputFingerprint: request.inputFingerprint,
+            durationCalibrationCutoff: request.durationCalibrationCutoff ?? context.now,
             supersedesPlanID: activePlan?.id,
             createdAt: context.now,
             updatedAt: context.now
@@ -719,6 +723,7 @@ struct LocalDailyPlanEngine: DailyPlanEngine {
         planID: UUID,
         dayKey: StudyDayKey,
         minutes: Int,
+        durationEstimateExplanation: String?,
         placement: (start: Date, end: Date, index: Int),
         context: PlanningContext,
         existing: DailyPlanItem?
@@ -733,6 +738,7 @@ struct LocalDailyPlanEngine: DailyPlanEngine {
             plannedScope: candidate.plannedScope,
             minimumScope: candidate.minimumScope,
             estimatedMinutes: minutes,
+            durationEstimateExplanation: durationEstimateExplanation,
             scheduledStart: placement.start,
             scheduledEnd: placement.end,
             scheduledDayKey: dayKey,

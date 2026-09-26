@@ -3,7 +3,7 @@ import SwiftUI
 // MARK: - G 模块：完整今日计划
 //
 // 需求 8 的落点：
-// - 「生成 / 重新评估计划」按钮（走 `AppStore.reevaluateTodayPlan`，输入没变时不会新建版本）；
+// - 「生成 / 重新规划今日计划」按钮（走 `AppStore.regenerateTodayPlan`，主动使用最新校准）；
 // - 「精力调整」（写入 `PlanningPreferences.energyLevelIdentifier`，并触发重新规划）；
 // - 「查看完整今日计划」：列出**全部来源**的计划项（课程回顾 / 预习 / 复习任务 / 手动任务），
 //   不是只展示旧的 `reviewTasks`；同时展示放不下的任务与计划解释。
@@ -254,18 +254,18 @@ struct TodayPlanDetailSheet: View {
             Button {
                 Task {
                     isWorking = true
-                    await store.reevaluateTodayPlan(reason: .firstEntryWithoutPlan, announcesResult: true)
+                    await store.regenerateTodayPlan(force: true)
                     isWorking = false
                 }
             } label: {
                 StudyActionPillLabel(
-                    title: isWorking ? "正在重新评估…" : (plan == nil ? "生成今日计划" : "重新评估计划"),
+                    title: isWorking ? "正在重新规划…" : (plan == nil ? "生成今日计划" : "重新规划今日计划"),
                     systemImage: "arrow.triangle.2.circlepath"
                 )
             }
             .buttonStyle(StudyActionPillButtonStyle(tint: StudyDesign.Colors.primary, prominence: .primary, size: .compact))
             .disabled(isWorking)
-            .accessibilityHint("按当前课表、作息、预算和精力重新计算今天的安排")
+            .accessibilityHint("使用最新学习记录、课表、作息和预算重新计算今天的安排")
 
             Button {
                 withAnimation(StudyDesign.Motion.animation(.fast)) {
@@ -393,6 +393,13 @@ struct TodayPlanDetailSheet: View {
                 .font(StudyDesign.Typography.supporting)
                 .foregroundStyle(StudyDesign.Colors.labelSecondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if let explanation = item.durationEstimateExplanation {
+                Text(explanation)
+                    .font(StudyDesign.Typography.supporting)
+                    .foregroundStyle(StudyDesign.Colors.labelSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             if let completion = completionEvent(for: item) {
                 Text(durationLine(completion))

@@ -223,10 +223,12 @@ struct DataLayerVerifyHarness {
             checkEqual(loaded.report.fromVersion, 4, "迁移报告记录原始版本为 4")
             checkEqual(
                 loaded.report.appliedSteps,
-                ["planning-layer-v4-to-v5", "manual-study-tasks-v5-to-v6", "manual-task-due-date-v6-to-v7"],
-                "迁移按顺序应用 4→5、5→6 与 6→7"
+                ["planning-layer-v4-to-v5", "manual-study-tasks-v5-to-v6", "manual-task-due-date-v6-to-v7", "active-recall-v7-to-v8", "document-evidence-v8-to-v9", "duration-calibration-v9-to-v10"],
+                "迁移按顺序应用 4→10"
             )
             check(!loaded.report.didFabricateRecords, "迁移没有产生虚构记录")
+            check(loaded.snapshot.studyCards.isEmpty && loaded.snapshot.reviewAttempts.isEmpty,
+                  "旧备份不会补造卡片或作答")
 
             checkEqual(loaded.snapshot.documents.count, 1, "旧资料保留")
             checkEqual(loaded.snapshot.knowledgePoints.count, 1, "旧知识点保留")
@@ -346,11 +348,14 @@ struct DataLayerVerifyHarness {
                     "legacy-normalize-v1-to-v4",
                     "planning-layer-v4-to-v5",
                     "manual-study-tasks-v5-to-v6",
-                    "manual-task-due-date-v6-to-v7"
+                    "manual-task-due-date-v6-to-v7",
+                    "active-recall-v7-to-v8",
+                    "document-evidence-v8-to-v9",
+                    "duration-calibration-v9-to-v10"
                 ],
-                "schema 1 按顺序应用四步显式迁移"
+                "schema 1 按顺序应用七步显式迁移"
             )
-            checkEqual(loaded.snapshot.schemaVersion, 7, "迁移结果是 schema 7")
+            checkEqual(loaded.snapshot.schemaVersion, 10, "迁移结果是 schema 10")
             checkEqual(loaded.snapshot.dailyActivityRecords.count, 1, "同一天的重复旧记录被合并")
             checkEqual(loaded.snapshot.dailyActivityRecords.first?.completedTaskCount, 4, "合并时保留较大的完成总数")
             check(
@@ -1303,13 +1308,27 @@ struct DataLayerVerifyHarness {
             check(json[SchedulePersistenceKeys.exceptions] != nil, "键名与 SchedulePersistenceKeys.exceptions 一致")
             check(json[SchedulePersistenceKeys.periodTemplates] != nil, "键名与 SchedulePersistenceKeys.periodTemplates 一致")
             check(json[SchedulePersistenceKeys.availabilitySettings] != nil, "键名与 SchedulePersistenceKeys.availabilitySettings 一致")
-            checkEqual(json["schemaVersion"] as? Int, 7, "导出的 schemaVersion 为 7")
+            checkEqual(json["schemaVersion"] as? Int, 10, "导出的 schemaVersion 为 10")
             for key in ["dailyPlans", "studySessions", "completionEvents", "entertainmentRules", "rewardGrants", "planningPreferences", "courseBurdenLevels", "semesterIdentity"] {
                 check(json[key] != nil, "导出的 JSON 含统一数据层字段 \(key)")
             }
-            checkEqual(StoreSnapshot().schemaVersion, 7, "新建快照的默认版本为 7")
-            checkEqual(StudySchema.currentVersion, 7, "版本常量集中定义为 7")
+            checkEqual(StoreSnapshot().schemaVersion, 10, "新建快照的默认版本为 10")
+            checkEqual(StudySchema.currentVersion, 10, "版本常量集中定义为 10")
             checkEqual(StudySchema.versionKeyName, "schemaVersion", "版本字段名由常量给出")
+            var privateSnapshot = StoreSnapshot()
+            var privateDocument = StudyDocument(title: "隔离 PDF", sourceName: "sample.pdf", kind: .note, content: "私密教材正文")
+            privateDocument.pages = [DocumentPage(documentID: privateDocument.id, pageNumber: 2,
+                                                  text: "私密第二页", method: .ocr, state: .succeeded, failureReason: nil)]
+            privateDocument.chunks = DocumentChunkBuilder.build(documentID: privateDocument.id,
+                                                                 content: privateDocument.content, pages: privateDocument.pages)
+            privateDocument.originalPDFFileName = "sample.pdf"
+            privateDocument.backupPDFData = Data("attachment".utf8)
+            privateSnapshot.documents = [privateDocument]
+            let redacted = SnapshotPrivacyRedactor.redact(privateSnapshot).snapshot.documents[0]
+            check(!redacted.content.contains("私密") && !redacted.pages[0].text.contains("私密") &&
+                  !redacted.chunks[0].text.contains("私密"), "隐私备份遮盖原文、页文本与分块")
+            check(redacted.originalPDFFileName == nil && redacted.backupPDFData == nil,
+                  "隐私备份不包含 PDF 附件")
         } catch {
             check(false, "导出探测键名不应抛错：\(error)")
         }

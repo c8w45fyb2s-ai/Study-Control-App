@@ -1,0 +1,50 @@
+name: Verify study flows
+
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  behavior:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      STUDYCOMPANION_TEST_MODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify local study and persistence flows
+        run: |
+          make BUILD_DIR="$RUNNER_TEMP/study-checks" \
+            verify-active-recall \
+            verify-merge-import \
+            verify-data-layer \
+            verify-ai-plan \
+            verify-daily-plan \
+            verify-integration \
+            verify-document-evidence \
+            verify-schedule-store
+
+  builds:
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        destination:
+          - generic/platform=macOS
+          - generic/platform=iOS Simulator
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ${{ matrix.destination }}
+        run: |
+          xcodebuild \
+            -project "study software.xcodeproj" \
+            -scheme "study software" \
+            -configuration Debug \
+            -destination '${{ matrix.destination }}' \
+            -derivedDataPath "$RUNNER_TEMP/StudyDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            build

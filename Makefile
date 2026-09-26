@@ -10,7 +10,7 @@ CONTENTS := $(APP_DIR)/Contents
 MACOS := $(CONTENTS)/MacOS
 RESOURCES := $(CONTENTS)/Resources
 
-.PHONY: all app run package \
+.PHONY: all app run package verify-active-recall verify-merge-import verify-document-evidence \
 verify-ai-plan verify-ai-protocols verify-dashboard verify-schedule verify-daily-plan verify-data-layer verify-integration verify-minimum-plan verify-entertainment verify-schedule-store clean
 
 all: app
@@ -48,6 +48,7 @@ package: app
 CORE_MODEL_SOURCES := \
 	"$(SOURCE_DIR)/AIPlanIntent.swift" \
 	"$(SOURCE_DIR)/Models.swift" \
+	"$(SOURCE_DIR)/DocumentEvidence.swift" \
 	"$(SOURCE_DIR)/ReviewPlanner.swift" \
 	"$(SOURCE_DIR)/AIPlanIterationEngine.swift" \
 	"$(SOURCE_DIR)/AIPlanDraftQualityValidator.swift" \
@@ -64,37 +65,51 @@ CORE_MODEL_SOURCES := \
 	"$(SOURCE_DIR)/EntertainmentModels.swift" \
 	"$(SOURCE_DIR)/PlanningContracts.swift" \
 	"$(SOURCE_DIR)/SnapshotMigration.swift" \
+	"$(SOURCE_DIR)/SnapshotMergeService.swift" \
 	"$(SOURCE_DIR)/PersistenceStore.swift"
 
-# C/D/E 模块的算法引擎与 G 模块的集成层。
-#
-# 这里用 shell 探测而不是硬编码：某个模块还没落地时不会让整个验证目标失败，
-# 一旦文件出现在源码目录里就会被自动纳入编译与验证，不需要再改 Makefile。
-# 除各模块的主引擎文件外，还探测两类辅助文件：
-#   · C 模块：候选构建 / 优先级 / 耗时估计 / 解释；
-#   · D 模块：TaskScopeReducer（MinimumPlanPolicy 依赖它，缺了会让所有验证目标编译失败）。
-#
-# 注意：源码目录名含空格，`ls` 的输出必须逐个加引号再交给 swiftc，
-# 否则 make 会按空格把 "study software/X.swift" 拆成两个参数导致编译失败。
+# 算法与协调层是必需依赖，缺少源码时直接报错。
+# 源码目录含空格，每个路径必须独立加引号。
 QUOTE_PATHS = sed 's/.*/"&"/' | tr '\n' ' '
-MODULE_SOURCES := $(shell ls "$(SOURCE_DIR)"/DailyPlanEngine.swift "$(SOURCE_DIR)"/MinimumPlanPolicy.swift "$(SOURCE_DIR)"/StudySessionEngine.swift "$(SOURCE_DIR)"/RewardEvaluator.swift 2>/dev/null | $(QUOTE_PATHS)) \
-	$(shell ls "$(SOURCE_DIR)"/TaskCandidateBuilder.swift "$(SOURCE_DIR)"/TaskPriorityPolicy.swift "$(SOURCE_DIR)"/TaskDurationEstimator.swift "$(SOURCE_DIR)"/PlanExplanationBuilder.swift "$(SOURCE_DIR)"/TaskScopeReducer.swift 2>/dev/null | $(QUOTE_PATHS)) \
+MODULE_SOURCES := \
+	"$(SOURCE_DIR)/DailyPlanEngine.swift" \
+	"$(SOURCE_DIR)/MinimumPlanPolicy.swift" \
+	"$(SOURCE_DIR)/StudySessionEngine.swift" \
+	"$(SOURCE_DIR)/RewardEvaluator.swift" \
+	"$(SOURCE_DIR)/TaskCandidateBuilder.swift" \
+	"$(SOURCE_DIR)/TaskPriorityPolicy.swift" \
+	"$(SOURCE_DIR)/TaskDurationEstimator.swift" \
+	"$(SOURCE_DIR)/PlanExplanationBuilder.swift" \
+	"$(SOURCE_DIR)/TaskScopeReducer.swift" \
 	"$(SOURCE_DIR)/PlanCoordination.swift" \
 	"$(SOURCE_DIR)/StudyRuntimeEnvironment.swift"
 
 # AppStore 保存链路的集成测试需要真实 Store 与存储实现，单独编译完整 app 源码
-#（排除唯一的 @main App 入口），测试入口仍留在 script/ 目录之外。
+#（排除唯一的 @main App 入口），测试入口保留在 script/ 目录中。
 SCHEDULE_STORE_TEST_SOURCES := $(shell find "$(SOURCE_DIR)" -maxdepth 1 -name '*.swift' ! -name 'StudyCompanionApp.swift' -print | $(QUOTE_PATHS))
 
-# C 模块（今日任务自动规划）的算法源码。
-#
-# 如果 D 的最低价策略实现已落地，就把真实实现一并编译进来，并打开
-# `CAN_USE_REAL_MINIMUM_POLICY`，让 C 的测试直接对接 D 的真实策略
-# （验证"接入 D、不另写第二套压缩算法"）；D 还没落地时只跑 C 自己的测试。
-# 注意：GNU make 的 $(wildcard) 处理含空格的路径不可靠（会返回空），因此这里用 shell 判断文件是否存在。
-DAILY_PLAN_FLAGS := $(shell [ -f "$(SOURCE_DIR)/MinimumPlanPolicy.swift" ] && [ -f "$(SOURCE_DIR)/TaskScopeReducer.swift" ] && echo -D CAN_USE_REAL_MINIMUM_POLICY)
+verify-active-recall:
+	mkdir -p "$(BUILD_DIR)"
+	swiftc -parse-as-library -module-cache-path "$(BUILD_DIR)/ModuleCache" $(SCHEDULE_STORE_TEST_SOURCES) "script/verify_active_recall_flow.swift" -framework Security -o "$(BUILD_DIR)/verify_active_recall_flow"
+	STUDYCOMPANION_TEST_MODE=1 "$(BUILD_DIR)/verify_active_recall_flow"
 
-DAILY_PLAN_SOURCES := $(CORE_MODEL_SOURCES) $(DAILY_PLAN_FLAGS) $(MODULE_SOURCES)
+# 两端手动合并：不同 ID 追加、同 ID 冲突保留本机、完成依据去重、附件与重复导入落盘。
+verify-merge-import:
+	mkdir -p "$(BUILD_DIR)"
+	swiftc -parse-as-library -module-cache-path "$(BUILD_DIR)/ModuleCache" $(SCHEDULE_STORE_TEST_SOURCES) "script/verify_merge_import_flow.swift" \
+		-framework SwiftUI -framework AppKit -framework Foundation -framework UniformTypeIdentifiers \
+		-framework PDFKit -framework Vision -framework Security -framework UserNotifications \
+		-o "$(BUILD_DIR)/verify_merge_import_flow"
+	STUDYCOMPANION_TEST_MODE=1 "$(BUILD_DIR)/verify_merge_import_flow"
+
+verify-document-evidence:
+	mkdir -p "$(BUILD_DIR)"
+	swiftc -parse-as-library -module-cache-path "$(BUILD_DIR)/ModuleCache" $(CORE_MODEL_SOURCES) "$(SOURCE_DIR)/DocumentProcessor.swift" "script/verify_document_evidence_flow.swift" \
+		-framework PDFKit -framework Vision -framework AppKit -o "$(BUILD_DIR)/verify_document_evidence_flow"
+	"$(BUILD_DIR)/verify_document_evidence_flow"
+
+# 今日规划始终验证与真实保底策略的集成。
+DAILY_PLAN_SOURCES := $(CORE_MODEL_SOURCES) $(MODULE_SOURCES)
 
 # AI 规划确认链路 + 智能负荷平衡（原有验证，保持通过）。
 verify-ai-plan:
@@ -130,10 +145,10 @@ verify-daily-plan:
 	swiftc -parse-as-library -module-cache-path "$(BUILD_DIR)/ModuleCache" $(DAILY_PLAN_SOURCES) "script/verify_daily_plan_flow.swift" -o "$(BUILD_DIR)/verify_daily_plan_flow"
 	"$(BUILD_DIR)/verify_daily_plan_flow"
 
-# 统一数据层（schema 6）的行为测试：迁移、兼容性、幂等键、备份一致性、隐私脱敏。
+# 统一数据层（当前 schema 10）的行为测试：迁移、兼容性、幂等键、备份一致性、隐私脱敏。
 verify-data-layer:
 	mkdir -p "$(BUILD_DIR)"
-	swiftc -parse-as-library -module-cache-path "$(BUILD_DIR)/ModuleCache" $(CORE_MODEL_SOURCES) "script/verify_data_layer_flow.swift" -o "$(BUILD_DIR)/verify_data_layer_flow"
+	swiftc -parse-as-library -module-cache-path "$(BUILD_DIR)/ModuleCache" $(CORE_MODEL_SOURCES) "script/support/StudyDataFactory.swift" "script/verify_data_layer_flow.swift" -o "$(BUILD_DIR)/verify_data_layer_flow"
 	"$(BUILD_DIR)/verify_data_layer_flow"
 
 # G 模块集成行为测试：统一提交顺序、幂等、跨日归属、奖励版本绑定、通知意图、备份往返。

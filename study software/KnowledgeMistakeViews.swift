@@ -464,7 +464,17 @@ struct MistakeRow: View {
     @State private var isShowingCompleteConfirmation = false
     @State private var isEditing = false
     @State private var isShowingDetails = false
+    @State private var practiceCard: StudyCard?
+    @State private var openedSource: SourceReference?
     var mistake: Mistake
+
+    private func openPractice() {
+        if let existing = store.snapshot.studyCards.first(where: { $0.mistakeID == mistake.id }) {
+            practiceCard = existing
+        } else {
+            practiceCard = store.createCard(from: mistake)
+        }
+    }
 
     private var relatedKnowledgeTitles: [String] {
         mistake.knowledgePointIDs.compactMap { id in
@@ -481,10 +491,20 @@ struct MistakeRow: View {
             mistakeContent
         }
         .contextMenu {
+            if let sourceDocumentID = mistake.sourceDocumentID {
+                Button("查看资料来源") {
+                    openedSource = mistake.sourceReference ?? SourceReference(documentID: sourceDocumentID,
+                        chunkID: nil, pageNumber: nil, excerpt: "")
+                }
+            }
+            Button("应用内重做") { openPractice() }
+            Button(mistake.practiceState == .mastered ? "恢复错题" : "手动归档") {
+                store.setMistakeArchived(mistake, archived: mistake.practiceState != .mastered)
+            }
             Button {
                 isShowingCompleteConfirmation = true
             } label: {
-                Label("完成并移除", systemImage: "checkmark.circle")
+                Label("订正完成", systemImage: "checkmark.circle")
             }
 
             Button {
@@ -502,6 +522,12 @@ struct MistakeRow: View {
         .sheet(isPresented: $isEditing) {
             MistakeEditSheetWrapper(mistake: mistake)
         }
+        .sheet(item: $practiceCard) { card in
+            ActiveRecallView(initialCardID: card.id).environmentObject(store)
+        }
+        .sheet(isPresented: Binding(get: { openedSource != nil }, set: { if !$0 { openedSource = nil } })) {
+            if let openedSource { SourceLocationView(reference: openedSource).environmentObject(store) }
+        }
         .alert("删除这道错题？", isPresented: $isShowingDeleteConfirmation) {
             Button("删除", role: .destructive) {
                 store.deleteMistake(mistake)
@@ -510,13 +536,13 @@ struct MistakeRow: View {
         } message: {
             Text("将删除这道错题以及它关联的复习任务。")
         }
-        .confirmationDialog("完成这道错题？", isPresented: $isShowingCompleteConfirmation, titleVisibility: .visible) {
-            Button("完成并移除") {
+        .confirmationDialog("完成订正？", isPresented: $isShowingCompleteConfirmation, titleVisibility: .visible) {
+            Button("订正完成") {
                 store.completeMistake(mistake)
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("完成后，这道错题会从错题库移除，关联复习任务会标记为已完成。")
+            Text("错题仍保留，接下来可应用内重做。")
         }
     }
 
@@ -566,7 +592,7 @@ struct MistakeRow: View {
     }
 
     private var mistakeTitleLabel: some View {
-        Label("错题分析", systemImage: "xmark.circle.fill")
+        Label(mistake.practiceState.label, systemImage: "xmark.circle.fill")
             .font(.caption.weight(.bold))
             .foregroundStyle(StudyDesign.Colors.danger)
             .padding(.horizontal, StudyDesign.Spacing.compact)
@@ -752,6 +778,9 @@ struct MistakeRow: View {
         HStack(spacing: StudyDesign.Spacing.tight) {
             detailsToggleButton
 
+            Button("重做") { openPractice() }
+                .buttonStyle(.bordered)
+
             completeButton
                 .frame(minWidth: 92)
 
@@ -765,6 +794,15 @@ struct MistakeRow: View {
 
     private var mistakeMoreMenu: some View {
         Menu {
+            if let sourceDocumentID = mistake.sourceDocumentID {
+                Button("查看资料来源") {
+                    openedSource = mistake.sourceReference ?? SourceReference(documentID: sourceDocumentID,
+                        chunkID: nil, pageNumber: nil, excerpt: "")
+                }
+            }
+            Button(mistake.practiceState == .mastered ? "恢复错题" : "手动归档") {
+                store.setMistakeArchived(mistake, archived: mistake.practiceState != .mastered)
+            }
             Button {
                 isEditing = true
             } label: {
@@ -800,7 +838,15 @@ struct MistakeRow: View {
         VStack(alignment: .trailing, spacing: StudyDesign.Spacing.tight) {
             detailsToggleButton
 
+            Button("应用内重做") { openPractice() }
+                .buttonStyle(.bordered)
+
             completeButton
+
+            Button(mistake.practiceState == .mastered ? "恢复" : "归档") {
+                store.setMistakeArchived(mistake, archived: mistake.practiceState != .mastered)
+            }
+            .buttonStyle(.bordered)
 
             Button {
                 isEditing = true
@@ -842,13 +888,13 @@ struct MistakeRow: View {
         Button {
             isShowingCompleteConfirmation = true
         } label: {
-            Label("完成", systemImage: "checkmark")
+            Label("订正完成", systemImage: "checkmark")
                 .font(.caption.weight(.semibold))
         }
         .buttonStyle(StudyActionPillButtonStyle(tint: StudyDesign.Colors.primary, prominence: .primary, size: .compact))
         .accessibilityLabel("完成错题：\(mistake.question)")
-        .accessibilityHint("将错题标记为已完成并删除")
-        .help("完成并从错题库移除")
+        .accessibilityHint("错题将保留，等待重做")
+        .help("完成订正并保留错题")
 #if os(iOS)
         .sensoryFeedback(.success, trigger: store.snapshot.mistakes.count)
 #endif
@@ -896,6 +942,8 @@ struct KnowledgePointCard: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showMasteryPicker = false
     @State private var isShowingDetails = false
+    @State private var practiceCard: StudyCard?
+    @State private var openedSource: SourceReference?
     @Namespace private var masterySelectionNamespace
     var point: KnowledgePoint
     @Binding var editingPoint: KnowledgePoint?
@@ -944,6 +992,13 @@ struct KnowledgePointCard: View {
             }
         }
         .contextMenu {
+            if let sourceDocumentID = point.sourceDocumentID {
+                Button("查看资料来源") {
+                    openedSource = point.sourceReference ?? SourceReference(documentID: sourceDocumentID,
+                        chunkID: nil, pageNumber: nil, excerpt: "")
+                }
+            }
+            Button("从知识点创建问答卡") { practiceCard = store.createCard(from: point) }
             Button {
                 withAnimation(reduceMotion ? nil : StudyDesign.Motion.animation(.spring)) {
                     showMasteryPicker.toggle()
@@ -979,6 +1034,12 @@ struct KnowledgePointCard: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("知识点：\(point.title)，\(point.subject)，掌握度 \(Int(point.mastery * 100))%")
+        .sheet(item: $practiceCard) { card in
+            ActiveRecallView(initialCardID: card.id).environmentObject(store)
+        }
+        .sheet(isPresented: Binding(get: { openedSource != nil }, set: { if !$0 { openedSource = nil } })) {
+            if let openedSource { SourceLocationView(reference: openedSource).environmentObject(store) }
+        }
     }
 
     private var compactSummaryLine: some View {
@@ -1308,6 +1369,15 @@ struct KnowledgePointCard: View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: StudyDesign.Spacing.tight) {
                 detailsToggleButton
+                Button("制卡") { practiceCard = store.createCard(from: point) }
+                    .buttonStyle(.bordered)
+                if let sourceDocumentID = point.sourceDocumentID {
+                    Button("来源") {
+                        openedSource = point.sourceReference ?? SourceReference(documentID: sourceDocumentID,
+                            chunkID: nil, pageNumber: nil, excerpt: "")
+                    }
+                    .buttonStyle(.bordered)
+                }
                 if isShowingDetails || showMasteryPicker {
                     masteryToggleButton
                 }

@@ -736,18 +736,6 @@ struct IntegrationVerifyHarness {
         check(!reminderBatch.scheduledChanges.keys.contains(ReminderKind.dailySummary.identifierPrefix), "空业务标识不会安排通知")
 
         var plannedSnapshot = StoreSnapshot()
-        let plannedItem = DailyPlanItem(
-            planID: plannedSnapshot.dailyPlans.first?.id ?? UUID(),
-            source: .manual(note: "自习"),
-            title: "自习",
-            plannedScope: .tasks(1),
-            estimatedMinutes: 30,
-            scheduledStart: date(2026, 9, 23, 20, 0),
-            scheduledEnd: date(2026, 9, 23, 20, 30),
-            scheduledDayKey: dayKey,
-            createdAt: now,
-            updatedAt: now
-        )
         let planID = UUID()
         let futureItem = DailyPlanItem(
             planID: planID,
@@ -1019,8 +1007,8 @@ struct IntegrationVerifyHarness {
         defer { try? FileManager.default.removeItem(at: location.directory) }
         do {
             let fileStore = try SnapshotFileStore(location: location)
-            let saved = try fileStore.save(first.snapshot)
-            check(saved == nil || true, "保存完整快照不抛错")
+            try fileStore.save(first.snapshot)
+            check(FileManager.default.fileExists(atPath: location.storeURL.path), "保存完整快照生成隔离数据文件")
             let reloaded = try fileStore.load()
             checkEqual(reloaded?.completionEvents.count, first.snapshot.completionEvents.count, "回读后的完成事件数量一致")
             checkEqual(reloaded?.schemaVersion, StudySchema.currentVersion, "回读后的 schema 版本为当前版本")

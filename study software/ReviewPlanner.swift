@@ -1,5 +1,20 @@
 import Foundation
 
+/// 调度算法边界：作答历史与卡片不依赖 SM-2 的内部状态。
+/// 后续替换算法时由迁移明确处理调度状态，不改写历史作答。
+protocol ReviewScheduling {
+    var identifier: String { get }
+    func schedule(task: ReviewTask, quality: ReviewPlanner.Quality, context: PlanningContext) -> ReviewTask
+}
+
+struct SM2ReviewScheduler: ReviewScheduling {
+    let identifier = "sm2"
+
+    func schedule(task: ReviewTask, quality: ReviewPlanner.Quality, context: PlanningContext) -> ReviewTask {
+        ReviewPlanner.scheduleNextReview(task: task, quality: quality, context: context)
+    }
+}
+
 /// SM-2 spaced repetition algorithm.
 ///
 /// Based on P.A. Wozniak's SuperMemo SM-2, simplified for a personal study tool.
@@ -158,11 +173,11 @@ enum ReviewPlanner {
     ) -> ReviewTask {
         switch tier {
         case .standard:
-            return scheduleNextReview(task: task, quality: quality, context: context)
+            return SM2ReviewScheduler().schedule(task: task, quality: quality, context: context)
         case .minimum:
             let capped = Quality(rawValue: min(quality.rawValue, Quality.incorrectButFamiliar.rawValue))
                 ?? .incorrectButFamiliar
-            return scheduleNextReview(task: task, quality: capped, context: context)
+            return SM2ReviewScheduler().schedule(task: task, quality: capped, context: context)
         case .studied:
             // 没有达到保底门槛：保留原到期日与 SM-2 状态，任务仍需继续。
             var unchanged = task
