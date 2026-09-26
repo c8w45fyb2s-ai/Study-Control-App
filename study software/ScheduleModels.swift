@@ -469,7 +469,11 @@ extension StoreSnapshot {
 
     /// 有效课表（缺学期时用兜底学期，仅供算法不崩溃；界面必须提示未设置）。
     var scheduleForComputation: ScheduleSnapshot {
-        schedule ?? ScheduleSnapshot(semester: .fallback)
+        if let schedule { return schedule }
+        // 无学期也要按用户的规划时区解释学习窗口，不能随运行设备时区漂移。
+        var fallbackSemester = ScheduleSemester.fallback
+        fallbackSemester.timeZoneIdentifier = planningTimeZoneIdentifier ?? TimeZone.current.identifier
+        return ScheduleSnapshot(semester: fallbackSemester)
     }
 
     /// 聚合可用时间偏好。

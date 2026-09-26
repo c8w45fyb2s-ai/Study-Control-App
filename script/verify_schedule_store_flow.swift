@@ -361,6 +361,7 @@ struct ScheduleStoreVerifyHarness {
                 grantedAt: manualNow
             )
             var rewardRecheckSeed = StoreSnapshot()
+            rewardRecheckSeed.planningPreferences = PlanningPreferences(planningTimeZoneIdentifier: manualContext.timeZone.identifier)
             rewardRecheckSeed.manualStudyTasks = [rewardedTask]
             rewardRecheckSeed.entertainmentRules = [manualRewardRule]
             rewardRecheckSeed.completionEvents = [manualTaskEvent.revoked(at: manualNow.addingTimeInterval(1), reason: "合成撤销")]
@@ -418,6 +419,7 @@ struct ScheduleStoreVerifyHarness {
                 grantedAt: rewardNow
             )
             var rewardSeed = StoreSnapshot()
+            rewardSeed.planningPreferences = PlanningPreferences(planningTimeZoneIdentifier: rewardContext.timeZone.identifier)
             rewardSeed.entertainmentRules = [rewardRule]
             rewardSeed.completionEvents = [rewardEvent]
             rewardSeed.rewardGrants = [rewardGrant]

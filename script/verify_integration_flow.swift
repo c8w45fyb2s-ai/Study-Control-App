@@ -880,6 +880,7 @@ struct IntegrationVerifyHarness {
 
         // 13. 学习报告分账
         var reportSnapshot = StoreSnapshot()
+        reportSnapshot.planningPreferences = PlanningPreferences(planningTimeZoneIdentifier: timeZoneIdentifier)
         var legacySnapshot = StoreSnapshot()
         legacySnapshot.dailyActivityRecords = [
             DailyActivityRecord(dateString: dayKey.localDateString, completedTaskCount: 3, studiedAt: now)
@@ -939,6 +940,7 @@ struct IntegrationVerifyHarness {
             now.addingTimeInterval(-20 * 24 * 60 * 60)
         )
         var sourceSnapshot = StoreSnapshot()
+        sourceSnapshot.planningPreferences = PlanningPreferences(planningTimeZoneIdentifier: timeZoneIdentifier)
         sourceSnapshot.completionEvents = [timedEvent, unrecordedEvent, legacyZeroEvent, manualZeroEvent, olderEvent]
         let sourceReport = StudyActivityReport.make(from: sourceSnapshot, periodDays: 7, now: now)
         checkEqual(sourceReport.studyCount, 4, "未记录时长的有效完成仍计入学习次数")
@@ -1189,6 +1191,8 @@ struct IntegrationVerifyHarness {
             context: context
         )
         let livePlan = livePlanResult.snapshot.dailyPlans.first { $0.dayKey == dayKey && $0.isActive }
+        checkEqual(liveSnapshot.scheduleForComputation.semester.timeZoneIdentifier, timeZoneIdentifier, "未配置学期时计算课表使用用户的规划时区")
+        check(liveSnapshot.scheduleSemester == nil, "计算兜底课表不会写入学期设置")
         check(livePlanResult.didChange, "真实引擎会生成今日计划（不再返回未接入）")
         check(livePlan != nil, "生成后存在生效的今日计划")
         check((livePlan?.items.count ?? 0) > 0, "到期的复习任务被排进今天的计划")
@@ -1244,6 +1248,7 @@ struct IntegrationVerifyHarness {
             now: context.now
         )
         checkEqual(availabilityA.totalFreeMinutes, availabilityB.totalFreeMinutes, "（前提）两个分布的总分钟数相同")
+        checkEqual(availabilityA.totalFreeMinutes, 120, "未配置学期时仍按规划时区识别周三的两小时学习窗口")
         let fingerprintA = fingerprint(for: windowA, dayKey: dayKey, context: context)
         let fingerprintB = fingerprint(for: windowB, dayKey: dayKey, context: context)
         check(fingerprintA != fingerprintB, "总时长相同但空闲时段不同 → 不同输入指纹")
@@ -1402,6 +1407,7 @@ struct IntegrationVerifyHarness {
             weekCount: 16,
             timeZoneIdentifier: timeZoneIdentifier
         )
+        checkEqual(withCourseSnapshot.scheduleForComputation.semester, withCourseSnapshot.scheduleSemester, "已配置学期时保留原课表学期")
         withCourseSnapshot.scheduleCourses = [
             Course(
                 name: "高等数学",

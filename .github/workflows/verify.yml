@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 45
     env:
       STUDYCOMPANION_TEST_MODE: "1"
+      TZ: UTC
     steps:
       - uses: actions/checkout@v4
       - name: Show build toolchain
@@ -35,6 +36,14 @@ jobs:
             verify-integration \
             verify-document-evidence \
             verify-schedule-store
+      - name: Verify integration and persistence across system time zones
+        run: |
+          for zone in Asia/Shanghai America/Los_Angeles; do
+            echo "Verifying integration with TZ=$zone"
+            TZ="$zone" "$RUNNER_TEMP/study-checks/verify_integration_flow"
+            TZ="$zone" STUDYCOMPANION_STORE_DIR="$RUNNER_TEMP/study-checks/schedule-store-default" \
+              "$RUNNER_TEMP/study-checks/verify_schedule_store_flow"
+          done
 
   builds:
     runs-on: macos-15
